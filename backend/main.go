@@ -70,24 +70,12 @@ func main() {
 		"analytics.events": 2,
 		"payments.work":    2,
 	}
-	var pools []*rabbitmq.WorkerPool
-	for _, q := range workQueuesFor(reg) {
-		n, ok := workerCount[q]
-		if !ok {
-			n = 2
-		}
-		wp := rabbitmq.NewWorkerPool(broker, top, q, n,
-			func(ctx context.Context, d rabbitmq.Delivery) error {
-				return nil // Phase 1: no business logic yet — accept, ack.
-			})
-		pools = append(pools, wp)
-		go wp.Run(ctx)
+	handler := func(ctx context.Context, d rabbitmq.Delivery) error {
+		return nil // Phase 1: no business logic yet — accept, ack.
 	}
-	defer func() {
-		for _, wp := range pools {
-			wp.Stop()
-		}
-	}()
+	pm := rabbitmq.NewPoolManager(broker, reg, workerCount, handler)
+	go pm.Run(ctx)
+	defer pm.Stop()
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -103,6 +91,27 @@ func main() {
 
 	// Synthetic publisher: prove publish → orders.work + analytics.events.
 	go runSyntheticPublisher(ctx, pub)
+
+	// TEMPORARY (Phase 1 demo): toggle Analytics Wired to show the PoolManager
+	// pausing/resuming a consumer pool. Pause at 8s, resume at 18s.
+	go func() {
+		select {
+		case <-time.After(8 * time.Second):
+			if reg.SetWired("analytics", false) {
+				log.Println("DEMO: analytics set unwired — analytics.events consumers stopping")
+			}
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-time.After(10 * time.Second):
+			if reg.SetWired("analytics", true) {
+				log.Println("DEMO: analytics set wired — analytics.events consumers restarting")
+			}
+		case <-ctx.Done():
+			return
+		}
+	}()
 
 	<-ctx.Done()
 	log.Println("shutting down…")
@@ -141,19 +150,4 @@ func runSyntheticPublisher(ctx context.Context, pub *rabbitmq.Publisher) {
 			log.Printf("published order.created id=ORD-%05d (confirmed)", seq)
 		}
 	}
-}
-
-// workQueuesFor collects the durable queue names owned by every Wired service,
-// so worker pools are created only against topology that actually exists.
-func workQueuesFor(reg rabbitmq.Registry) []string {
-	seen := map[string]bool{}
-	var out []string
-	for _, q := range reg.WiredTopology().Queues {
-		if seen[q.Name] {
-			continue
-		}
-		seen[q.Name] = true
-		out = append(out, q.Name)
-	}
-	return out
 }

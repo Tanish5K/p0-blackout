@@ -1,33 +1,37 @@
 package rabbitmq
 
+import "sync"
+
 // Service is a named Lumen subsystem in the ops room. Every service exists as
 // a visible node from run one, but only a Wired service contributes RabbitMQ
 // topology (exchanges/queues/bindings). Unwired services are stubs (§5.2): they
 // report idle state and carry no MQ until their incident flips Wired on.
-//
-// Going "live" in a later incident is flipping Wired=true and appending the
-// service's topology snippet — no registry retrofit needed.
 type Service struct {
-	ID         string
-	Name       string
-	Critical   bool   // Payments/Identity/Orders/Audit are critical
-	Wired      bool
-	WiredIn    int    // campaign incident where Wired becomes true (0 = from start)
-	Topology   Topology // MQ resources this service owns (only meaningfully declared when Wired)
+	ID       string // stable id, e.g. "orders"
+	Name     string // display name
+	Critical bool   // Payments/Identity/Orders/Audit are critical
+	Wired    bool   // has real MQ topology + consumers
+	WiredIn  int    // campaign incident where Wired becomes true (0 = from start)
+	Topology Topology
 }
 
-// Registry holds every known Lumen service, wired or not (§5.2 rollout).
+// Registry holds every known Lumen service, wired or not (§5.2 rollout). It is
+// the single source of truth for which services currently have live MQ. Pool
+// owners subscribe to Wired changes so toggling a service (e.g. a player pause)
+// starts or stops its consumers without restarting the process.
 type Registry struct {
+	mu       sync.RWMutex
 	Services []Service
+	subs     []chan struct{}
 }
 
 // AllServices returns the full 7-service Lumen registry. The four core
 // services (Gateway, Orders, Payments, Analytics) are Wired from incident 1
 // (§5.1); Identity, Notifications, and Audit start as stubs and go live in
 // incidents 2, 3, and 4 respectively.
-func AllServices() Registry {
-	reg := Registry{Services: make([]Service, 0, 7)}
-	reg.Services = append(reg.Services,
+func AllServices() *Registry {
+	r := &Registry{Services: make([]Service, 0, 7)}
+	r.Services = append(r.Services,
 		Service{
 			ID: "gateway", Name: "Gateway", Critical: true, Wired: true, WiredIn: 0,
 			Topology: Topology{Exchanges: []Exchange{
@@ -81,21 +85,51 @@ func AllServices() Registry {
 			ID: "audit", Name: "Audit", Critical: true, Wired: false, WiredIn: 4,
 		},
 	)
-	return reg
+	return r
 }
 
-// Get returns the service with the given ID, or nil.
-func (r Registry) Get(id string) *Service {
+// Get returns the current service with the given ID, or nil.
+// The returned copy is a snapshot; mutate via SetWired.
+func (r *Registry) Get(id string) *Service {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	for i := range r.Services {
 		if r.Services[i].ID == id {
-			return &r.Services[i]
+			s := r.Services[i]
+			return &s
 		}
 	}
 	return nil
 }
 
-// Wired returns the services currently marked Wired.
-func (r Registry) Wired() []Service {
+// SetWired toggles a service's live-MQ state and notifies subscribers if it
+// changed. Returns true when the state actually flipped.
+func (r *Registry) SetWired(id string, wired bool) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := range r.Services {
+		if r.Services[i].ID == id {
+			if r.Services[i].Wired == wired {
+				return false
+			}
+			r.Services[i].Wired = wired
+			// Snapshot subscribers and notify outside the lock.
+			for _, sub := range r.subs {
+				select {
+				case sub <- struct{}{}:
+				default:
+				}
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// Wired returns snapshots of the services currently marked Wired.
+func (r *Registry) Wired() []Service {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	out := make([]Service, 0, len(r.Services))
 	for _, s := range r.Services {
 		if s.Wired {
@@ -105,10 +139,11 @@ func (r Registry) Wired() []Service {
 	return out
 }
 
-// WiredTopology merges the topology snippets of every Wired service into a
-// single topology suitable for Declare. Unwired services contribute nothing,
-// so no stray exchanges/queues/bindings are created for stub nodes.
-func (r Registry) WiredTopology() Topology {
+// WiredTopology merges the topology snippets of Wired services. Unwired
+// services contribute nothing, so no stray MQ resources exist for stubs.
+func (r *Registry) WiredTopology() Topology {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	top := Topology{Name: "lumen"}
 	for _, s := range r.Services {
 		if !s.Wired {
@@ -119,4 +154,37 @@ func (r Registry) WiredTopology() Topology {
 		top.Bindings = append(top.Bindings, s.Topology.Bindings...)
 	}
 	return top
+}
+
+// WiredQueues returns the distinct durable queue names owned by Wired
+// services, in a stable order.
+func (r *Registry) WiredQueues() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range r.Services {
+		if !s.Wired {
+			continue
+		}
+		for _, q := range s.Topology.Queues {
+			if seen[q.Name] {
+				continue
+			}
+			seen[q.Name] = true
+			out = append(out, q.Name)
+		}
+	}
+	return out
+}
+
+// Subscribe registers a channel that receives a broadcast whenever a Wired
+// flag changes. The channel is buffered(1); slow consumers may miss a change
+// and should reconcile by comparing desired vs actual state on any signal.
+func (r *Registry) Subscribe() <-chan struct{} {
+	ch := make(chan struct{}, 1)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.subs = append(r.subs, ch)
+	return ch
 }
