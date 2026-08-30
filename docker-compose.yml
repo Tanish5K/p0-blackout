@@ -1,0 +1,23 @@
+services:
+  rabbitmq:
+    image: rabbitmq:4.3.5-management-alpine
+    container_name: blackout-rabbitmq
+    hostname: blackout-rabbitmq
+    ports:
+      - "5673:5672"      # AMQP
+      - "15673:15672"    # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: lumen
+      RABBITMQ_DEFAULT_PASS: lumen
+      RABBITMQ_DEFAULT_VHOST: /
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+volumes:
+  rabbitmq_data:
