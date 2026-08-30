@@ -28,13 +28,12 @@ func NewBroker(url string) *Broker {
 }
 
 // Connect establishes the connection and blocks until the broker is ready or
-// the context is done. It keeps retrying so the backend can come up before
-// RabbitMQ (e.g. right after docker compose up).
-func (b *Broker) Connect() error {
+// the context is done.
+func (b *Broker) Connect(ctx context.Context) error {
+	if b.url == "" {
+		return fmt.Errorf("empty AMQP URL")
+	}
 	for {
-		if b.url == "" {
-			return fmt.Errorf("empty AMQP URL")
-		}
 		conn, err := amqp.Dial(b.url)
 		if err == nil {
 			b.mu.Lock()
@@ -47,7 +46,11 @@ func (b *Broker) Connect() error {
 			return nil
 		}
 		log.Printf("rabbitmq not ready (%v); retrying in 2s", err)
-		time.Sleep(2 * time.Second)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
 	}
 }
 

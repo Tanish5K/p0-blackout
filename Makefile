@@ -14,7 +14,7 @@ down:
 	docker compose down
 
 backend:
-	go run ./backend
+	cd backend && go build -o blackout.exe . && ./blackout.exe
 
 frontend:
 	cd frontend && npm run dev

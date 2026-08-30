@@ -25,14 +25,18 @@ func main() {
 	}
 	amqpURL := os.Getenv("BLACKOUT_AMQP_URL")
 	if amqpURL == "" {
-		amqpURL = "amqp://lumen:lumen@localhost:5672/"
+		amqpURL = "amqp://lumen:lumen@localhost:5673/"
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	broker := rabbitmq.NewBroker(amqpURL)
-	if err := broker.Connect(); err != nil {
+	if err := broker.Connect(ctx); err != nil {
+		if ctx.Err() != nil {
+			log.Println("interrupted before connecting; shutting down")
+			return
+		}
 		log.Fatalf("connect rabbitmq: %v", err)
 	}
 	defer broker.Close()
@@ -63,6 +67,14 @@ func main() {
 		})
 	go orders.Run(ctx)
 	defer orders.Stop()
+
+	analytics := rabbitmq.NewWorkerPool(broker, top, "analytics.events", 2,
+    func(ctx context.Context, d rabbitmq.Delivery) error {
+        return nil // accept, ack
+    })
+	go analytics.Run(ctx)
+	defer analytics.Stop()
+	
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -103,7 +115,7 @@ func runSyntheticPublisher(ctx context.Context, pub *rabbitmq.Publisher) {
 			return
 		case tick := <-t.C:
 			seq++
-			body := []byte(fmt.Sprintf(
+			body := []byte(fmt.Appendf(nil,
 				`{"orderId":"ORD-%05d","event":"order.created","ts":"%s"}`,
 				seq, tick.UTC().Format(time.RFC3339)))
 			pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
