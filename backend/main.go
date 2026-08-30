@@ -41,7 +41,10 @@ func main() {
 	}
 	defer broker.Close()
 
-	top := rabbitmq.LumenTopology()
+	// Only Wired services contribute exchanges/queues/bindings; Identity/Notifications/Audit are
+	// stubs until their incident flips Wired on (§5.2).
+	reg := rabbitmq.AllServices()
+	top := reg.WiredTopology()
 	{
 		ch, err := broker.Channel()
 		if err != nil {
@@ -52,6 +55,8 @@ func main() {
 		}
 		_ = ch.Close()
 	}
+	log.Printf("wired services: %d of %d (stubs: identity, notifications, audit)",
+		len(reg.Wired()), len(reg.Services))
 
 	pub, err := rabbitmq.NewPublisher(broker)
 	if err != nil {
@@ -59,22 +64,30 @@ func main() {
 	}
 	defer pub.Close()
 
-	// orders.work consumers: manual ack, log every message to stdout.
-	orders := rabbitmq.NewWorkerPool(broker, top, "orders.work", 3,
-		func(ctx context.Context, d rabbitmq.Delivery) error {
-			// Phase 1: no business logic yet — just accept the message.
-			return nil
-		})
-	go orders.Run(ctx)
-	defer orders.Stop()
-
-	analytics := rabbitmq.NewWorkerPool(broker, top, "analytics.events", 2,
-    func(ctx context.Context, d rabbitmq.Delivery) error {
-        return nil // accept, ack
-    })
-	go analytics.Run(ctx)
-	defer analytics.Stop()
-	
+	// Worker counts per wireable work queue (Phase 1: accept & ack).
+	workerCount := map[string]int{
+		"orders.work":      3,
+		"analytics.events": 2,
+		"payments.work":    2,
+	}
+	var pools []*rabbitmq.WorkerPool
+	for _, q := range workQueuesFor(reg) {
+		n, ok := workerCount[q]
+		if !ok {
+			n = 2
+		}
+		wp := rabbitmq.NewWorkerPool(broker, top, q, n,
+			func(ctx context.Context, d rabbitmq.Delivery) error {
+				return nil // Phase 1: no business logic yet — accept, ack.
+			})
+		pools = append(pools, wp)
+		go wp.Run(ctx)
+	}
+	defer func() {
+		for _, wp := range pools {
+			wp.Stop()
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:              addr,
@@ -128,4 +141,19 @@ func runSyntheticPublisher(ctx context.Context, pub *rabbitmq.Publisher) {
 			log.Printf("published order.created id=ORD-%05d (confirmed)", seq)
 		}
 	}
+}
+
+// workQueuesFor collects the durable queue names owned by every Wired service,
+// so worker pools are created only against topology that actually exists.
+func workQueuesFor(reg rabbitmq.Registry) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, q := range reg.WiredTopology().Queues {
+		if seen[q.Name] {
+			continue
+		}
+		seen[q.Name] = true
+		out = append(out, q.Name)
+	}
+	return out
 }

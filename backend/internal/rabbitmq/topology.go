@@ -52,26 +52,11 @@ type Topology struct {
 	Bindings  []Binding
 }
 
-// LumenTopology returns the default startup topology (§5.1 of the plan).
+// LumenTopology is retained as a convenience for tests/tools: the wired
+// topology of the startup registry (§5.1). Prefer Registry.WiredTopology() so
+// stub services stay excluded.
 func LumenTopology() Topology {
-	return Topology{
-		Name: "lumen",
-		Exchanges: []Exchange{
-			{Name: "gateway.events", Type: ExchangeTopic, Durable: true},
-			{Name: "order.events", Type: ExchangeTopic, Durable: true},
-			{Name: "payment.events", Type: ExchangeDirect, Durable: true},
-		},
-		Queues: []Queue{
-			{Name: "orders.work", Durable: true},
-			{Name: "analytics.events", Durable: true},
-			{Name: "payments.work", Durable: true},
-		},
-		Bindings: []Binding{
-			{Queue: "orders.work", Exchange: "order.events", RoutingKey: "order.created"},
-			{Queue: "analytics.events", Exchange: "order.events", RoutingKey: "order.created"},
-			{Queue: "payments.work", Exchange: "payment.events", RoutingKey: "payment.auth"},
-		},
-	}
+	return AllServices().WiredTopology()
 }
 
 // Declare creates every exchange, queue, and binding in the topology on the

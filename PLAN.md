@@ -289,6 +289,25 @@ Lumen operates a city-scale event and commerce platform. Services are intentiona
 - Queues: `orders.work` (durable), `analytics.events` (durable), `payments.work` (durable)
 - Bindings: `order.created` → `orders.work`, `order.created` → `analytics.events`, `payment.auth` → `payments.work`
 
+### 5.2 Service Introduction & Topology Rollout
+
+The fictional world has seven services, but not all of them have real RabbitMQ topology from the start. Introducing every service's exchanges/queues/consumers up front would (a) bloat the MVP, and (b) dump architecture on the player before the incident that makes it relevant — violating design rule 7 (introduce tools when their behavior becomes necessary).
+
+**Guiding rule:** Every service exists as a *visible, inspectable system-map node with health/success metrics* from run one, but only gains *real RabbitMQ topology + consumers* in the incident where it becomes mechanically relevant. This keeps the fiction coherent (all seven services are present in the ops room) without building premature infrastructure.
+
+**Stub-node behavior:** Until a service gains real topology it is **purely static** — reported `health 100`, `load 0`, `status idle` in every snapshot. It has no hidden failure states and cannot be acted on. It is decoration until its incident.
+
+| Service | Visible node from | Real MQ topology + consumer added | Why that incident |
+| --- | --- | --- | --- |
+| Gateway, Orders, Payments, Analytics | Incident 1 (MVP) | Incident 1 | §5.1 — the core stampede path |
+| Identity | Incident 1 | Incident 2 | Synchronous & critical; the "critical services" concept must exist. Its crash mechanic (Incident 2) needs it live. |
+| Notifications | Incident 1 | Incident 3 | The Poison Pill is a notification job — pausing Notifications only carries tradeoff weight once it is real MQ. |
+| Audit | Incident 1 | Incident 4 | Durable + compliance; belongs with the "everyone needs to know" broadcast incident. |
+
+**Consequence for later incidents:** Incident 4's "outage broadcast must reach independent services" and Incident 5's "Analytics receives `identity.*` / `notification.*` noise" only become demonstrable once Identity/Notifications/Audit have live topology. Routing keys for these families are added to the topic tree in the same incident the service goes live.
+
+**Backend/UI implication:** The game needs a *service registry*: each `Service` can be marked `visible-only` (stub) vs `fully-wired` (has MQ). The snapshot protocol (PLAN §4.2) already sends all services every tick, so stubs just report idle state. Because the `Topology` type is data-driven (§5.1 / Phase 1 `topology.go`), growing the architecture per incident is simply appending exchange/queue/binding entries to the incident's topology slice — no structural code change.
+
 ---
 
 ## 6. Core Roguelike Systems
