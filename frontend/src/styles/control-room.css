@@ -1,0 +1,83 @@
+:root {
+  --charcoal: #1b1d22;
+  --charcoal-2: #23262e;
+  --panel: #262a33;
+  --line: #363b46;
+  --warn: #d9702f;
+  --cyan: #2fb8c4;
+  --healthy: #7fb58a;
+  --offwhite: #d9d6cf;
+  --mono: 'DM Mono', 'Consolas', monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--charcoal);
+  color: var(--offwhite);
+  font-family: var(--mono);
+}
+
+.app {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  height: 100%;
+}
+
+.status-rail {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: var(--charcoal-2);
+  border-bottom: 1px solid var(--line);
+}
+
+.status-rail h1 {
+  font-size: 20px;
+  letter-spacing: 4px;
+  color: var(--offwhite);
+  margin: 0;
+}
+
+.conn.pill {
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.conn.pill.connected {
+  color: var(--healthy);
+  border-color: var(--healthy);
+}
+
+.conn.pill.connecting {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+.conn.pill.disconnected {
+  color: #e0655a;
+  border-color: #e0655a;
+}
+
+.system-map {
+  display: grid;
+  place-items: center;
+}
+
+.placeholder {
+  color: var(--line);
+  font-size: 14px;
+}
