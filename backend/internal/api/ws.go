@@ -13,8 +13,8 @@ import (
 // Hub tracks live WebSocket connections. Phase 0 only verifies connectivity;
 // game state broadcasting lands in a later phase.
 type Hub struct {
-	mu   sync.Mutex
-	conns map[*websocket.Conn]bool
+	mu     sync.Mutex
+	conns  map[*websocket.Conn]bool
 	origin string
 }
 

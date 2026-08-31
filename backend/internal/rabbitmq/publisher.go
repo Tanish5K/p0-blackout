@@ -44,9 +44,9 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, bo
 		return err
 	}
 	pub := amqp.Publishing{
-		ContentType: "application/json",
+		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
-		Body:        body,
+		Body:         body,
 	}
 	seq := p.channel.GetNextPublishSeqNo()
 	err := p.channel.PublishWithContext(ctx, exchange, routingKey, false, false, pub)

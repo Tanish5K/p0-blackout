@@ -19,11 +19,11 @@ type Handler func(ctx context.Context, d amqp.Delivery) error
 // WorkerPool consumes a single queue with N competing consumers. Every message
 // is delivered with manual acknowledgement; the handler decides what to do.
 type WorkerPool struct {
-	broker  *Broker
+	broker   *Broker
 	topology Topology
-	queue   string
-	workers int
-	handler Handler
+	queue    string
+	workers  int
+	handler  Handler
 
 	mu   sync.Mutex
 	stop context.CancelFunc
