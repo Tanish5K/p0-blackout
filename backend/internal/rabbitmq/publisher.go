@@ -69,6 +69,60 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, bo
 	}
 }
 
+// PublishBatch publishes a batch of messages to exchange with routingKey and
+// waits until every one of them is confirmed. RabbitMQ may ack a whole range
+// with a single confirmation carrying multiple=true, so the drain tracks the
+// highest confirmed delivery tag rather than counting confirmations one-to-one.
+// The batch completes once that tag is >= the last sequence number in the batch.
+//
+// Batching the confirm wait keeps the tick loop from round-tripping to the
+// broker once per message at stampede scale (per-message confirm-and-wait would
+// stall a 10k msgs/sec run).
+func (p *Publisher) PublishBatch(ctx context.Context, exchange, routingKey string, bodies [][]byte) error {
+	if len(bodies) == 0 {
+		return nil
+	}
+	p.mu.Lock()
+	if err := p.ensureChannelLocked(); err != nil {
+		p.mu.Unlock()
+		return err
+	}
+	firstSeq := p.channel.GetNextPublishSeqNo()
+	for _, body := range bodies {
+		pub := amqp.Publishing{
+			ContentType:  "application/json",
+			DeliveryMode: amqp.Persistent,
+			Body:         body,
+		}
+		if err := p.channel.PublishWithContext(ctx, exchange, routingKey, false, false, pub); err != nil {
+			p.mu.Unlock()
+			return fmt.Errorf("publish batch: %w", err)
+		}
+	}
+	lastSeq := firstSeq + uint64(len(bodies)) - 1
+	p.mu.Unlock()
+
+	// Drain confirms until the highest confirmed tag covers the whole batch.
+	highest := uint64(0)
+	for highest < lastSeq {
+		select {
+		case conf, ok := <-p.confirms:
+			if !ok {
+				return fmt.Errorf("publish batch: confirm channel closed")
+			}
+			if !conf.Ack {
+				return fmt.Errorf("publish batch: nack (delivery %d)", conf.DeliveryTag)
+			}
+			if conf.DeliveryTag > highest {
+				highest = conf.DeliveryTag
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
 // ensureChannelLocked replaces a dead channel. Caller must hold p.mu.
 func (p *Publisher) ensureChannelLocked() error {
 	if p.channel.IsClosed() {

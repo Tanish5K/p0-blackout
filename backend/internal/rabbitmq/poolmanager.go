@@ -12,8 +12,7 @@ import (
 // drained, so backlog accumulates. When wired, a pool is created/restarted.
 //
 // Declared MQ resources are intentionally left in place on pause so a paused
-// queue keeps accumulating; that is the desired game behavior (§5.2 "pause
-// Analytics -> neglect a queue").
+// queue keeps accumulating; that is the desired game behavior
 type PoolManager struct {
 	broker  *Broker
 	reg     *Registry
