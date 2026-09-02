@@ -41,7 +41,7 @@ func newQueueCache() *queueCache {
 // runSimulation drives the real simulation: on each 100ms tick it decides what
 // to publish, publishes it for real through the confirmed Publisher, and turns
 // the (real, polled) queue depth back into metrics.
-func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.Mgmt) {
+func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.Mgmt, rt *simulation.Runtime) {
 	const seed = 42
 	profile := simulation.StampedeProfile{
 		BaseRate: 200,
@@ -50,6 +50,7 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 		Hold:     30 * time.Second,
 	}
 	state := simulation.NewGame(seed, profile)
+	state.Sim = rt
 
 	cache := newQueueCache()
 	queueNames := snapshotQueueNames(state)
@@ -71,7 +72,7 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 			for _, e := range evs {
 				state.Log.Append(e)
 			}
-			// bridgePublish(ctx, pub, state)
+			bridgePublish(ctx, pub, state)
 			applyCache(cache, state)
 			state.Log.Trim(maxEvents)
 			if state.Tick%10 == 0 {
@@ -83,18 +84,27 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 
 // bridgePublish turns this tick's publish plan (decided deterministically by
 // Tick) into real messages on RabbitMQ. Order events fan out to orders.work and
-// analytics.events; a small share becomes payment authorisations.
+// analytics.events; a small share becomes payment authorisations. Every
+// successfully published batch also feeds the load trackers so workers feel
+// the new load immediately — the management snapshot only reconciles drift.
 func bridgePublish(ctx context.Context, pub *rabbitmq.Publisher, s *simulation.GameState) {
 	if s.Traffic.OrderMessagesThisTick > 0 {
-		bodies := makeBodies(s.Traffic.OrderMessagesThisTick, "order.created", s.Tick)
+		n := s.Traffic.OrderMessagesThisTick
+		bodies := makeBodies(n, "order.created", s.Tick)
 		if err := publishWithRetry(ctx, pub, "order.events", "order.created", bodies); err != nil {
-			appendDropped(s, "order.events", int64(len(bodies)), err)
+			appendDropped(s, "order.events", n, err)
+		} else {
+			s.Sim.AddPublished("orders.work", int(n))
+			s.Sim.AddPublished("analytics.events", int(n))
 		}
 	}
 	if s.Traffic.PayMessagesThisTick > 0 {
-		bodies := makeBodies(s.Traffic.PayMessagesThisTick, "payment.auth", s.Tick)
+		n := s.Traffic.PayMessagesThisTick
+		bodies := makeBodies(n, "payment.auth", s.Tick)
 		if err := publishWithRetry(ctx, pub, "payment.events", "payment.auth", bodies); err != nil {
-			appendDropped(s, "payment.events", int64(len(bodies)), err)
+			appendDropped(s, "payment.events", n, err)
+		} else {
+			s.Sim.AddPublished("payments.work", int(n))
 		}
 	}
 }
@@ -141,7 +151,9 @@ func appendDropped(s *simulation.GameState, subject string, n int64, err error) 
 
 // applyCache writes the latest polled telemetry into the state's queues and
 // pools, reading the poller's cache without blocking. Missing entries leave the
-// last-known values untouched (no zeroing).
+// last-known values untouched (no zeroing). It also reconciles the load
+// trackers against the authoritative real depth (client-prediction /
+// server-snapshot pattern).
 func applyCache(c *queueCache, s *simulation.GameState) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -155,6 +167,7 @@ func applyCache(c *queueCache, s *simulation.GameState) {
 		s.Queues[i].Unacked = cq.stats.MessagesUnacked
 		s.Queues[i].RateIn = cq.rateIn
 		s.Queues[i].RateOut = cq.rateOut
+		s.Sim.Reconcile(s.Queues[i].Name, cq.stats.Messages)
 	}
 	for i := range s.Pools {
 		if cq, ok := c.data[s.Pools[i].Queue]; ok {

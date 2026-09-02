@@ -12,9 +12,10 @@ import (
 // pool users don't import amqp directly.
 type Delivery = amqp.Delivery
 
-// Handler processes one message. It must call d.Ack / d.Nack / d.Reject itself
-// so the pool never auto-acks — manual acknowledgement is the whole point.
-type Handler func(ctx context.Context, d amqp.Delivery) error
+// Handler processes one message. It receives the queue name (so a shared
+// handler can tailor behaviour per queue) and the delivery; it must call
+// d.Ack / d.Nack / d.Reject itself — manual acknowledgement is the whole point.
+type Handler func(ctx context.Context, queue string, d amqp.Delivery) error
 
 // WorkerPool consumes a single queue with N competing consumers. Every message
 // is delivered with manual acknowledgement; the handler decides what to do.
@@ -139,7 +140,7 @@ func (p *WorkerPool) consumeLoop(ctx context.Context) error {
 
 func (p *WorkerPool) handle(ctx context.Context, id int, d amqp.Delivery) {
 	log.Printf("[%s worker %d] received         %q (id=%s)", p.queue, id, d.Body, d.MessageId)
-	if err := p.handler(ctx, d); err != nil {
+	if err := p.handler(ctx, p.queue, d); err != nil {
 		log.Printf("[%s worker %d] handler failed:  %v (nacked, redelivery=%v)",
 			p.queue, id, err, d.Redelivered)
 		_ = d.Nack(false, true)

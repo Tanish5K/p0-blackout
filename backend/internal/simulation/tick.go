@@ -51,31 +51,7 @@ func Tick(s *GameState, dt time.Duration) []events.Event {
 		})
 	}
 
-	// --- 3. Service load: proportional to the demand each subsystem routes. --
-	svcLoad := map[string]float64{
-		"gateway":   clamp01(float64(reqs) / 12000),
-		"orders":    clamp01(float64(reqs) / 8000),
-		"payments":  clamp01(float64(payIn) / 3000),
-		"analytics": clamp01(float64(reqs) / 15000),
-	}
-	for i := range s.Services {
-		sv := &s.Services[i]
-		sv.Load = svcLoad[sv.ID]
-		// health drifts down with sustained overload
-		if sv.Load > 0.9 {
-			if sv.Health > 0 {
-				sv.Health -= 1
-			}
-		} else if sv.Health < 100 && sv.Load < 0.7 {
-			sv.Health += 0.5
-			if sv.Health > 100 {
-				sv.Health = 100
-			}
-		}
-		sv.Status = classify(sv.Health)
-	}
-
-	// --- 4. Derived metrics from the QueueState the bridge handed in. --------
+	// --- 3. Derived metrics from the real QueueState + worker telemetry. ------
 	deriveMetrics(s)
 
 	// Emit a metric event every N ticks so the terminal shows a moving rail.

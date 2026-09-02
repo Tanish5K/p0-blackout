@@ -18,6 +18,11 @@ type GameState struct {
 	rng     *rand.Rand
 	profile TrafficProfile
 
+	// Sim is the runtime bridge to the real broker-side workers: their load
+	// trackers, latency samplers and simulated DBs. It is attached by the
+	// driver (main/sim) after NewGame; metrics derive service health from it.
+	Sim *Runtime
+
 	Traffic  TrafficState
 	Services []ServiceState
 	Queues   []QueueState

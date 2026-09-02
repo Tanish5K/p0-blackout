@@ -11,6 +11,7 @@ import (
 
 	"blackout/internal/api"
 	"blackout/internal/rabbitmq"
+	"blackout/internal/simulation"
 )
 
 func main() {
@@ -67,14 +68,15 @@ func main() {
 	}
 	defer pub.Close()
 
-	// Worker counts per wireable work queue (Phase 1: accept & ack).
+	// Worker counts per wireable work queue (Phase 2: real simulated work).
+	rt := simulation.NewRuntime()
 	workerCount := map[string]int{
 		"orders.work":      3,
 		"analytics.events": 2,
 		"payments.work":    2,
 	}
-	handler := func(ctx context.Context, d rabbitmq.Delivery) error {
-		return nil // Phase 1: no business logic yet — accept, ack.
+	handler := func(ctx context.Context, queue string, d rabbitmq.Delivery) error {
+		return simulation.Work(ctx, rt, queue)
 	}
 	pm := rabbitmq.NewPoolManager(broker, reg, workerCount, handler)
 	go pm.Run(ctx)
@@ -96,7 +98,7 @@ func main() {
 	// decided traffic for real and reads real queue depth back from RabbitMQ's
 	// management API
 	mgmt := rabbitmq.NewMgmt(mgmtURL, "lumen", "lumen")
-	go runSimulation(ctx, pub, mgmt)
+	go runSimulation(ctx, pub, mgmt, rt)
 
 	<-ctx.Done()
 	log.Println("shutting down…")

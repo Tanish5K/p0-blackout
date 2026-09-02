@@ -2,53 +2,119 @@ package simulation
 
 import "time"
 
-// deriveMetrics recomputes the operational metrics from queue depths and pool
-// utilisation. The model is intentionally simple but internally consistent:
-// latency rises with queue depth and saturation, success rate falls when
-// queues back up, and system health tracks the weakest service.
+// deriveMetrics recomputes service load, health and the operational rail from
+// real worker telemetry ("published - acked" load trackers reconciled against
+// the management snapshot, real per-message latency samplers, real ack/fail
+// counters). No backlog math invents the p50/p99 anymore — those are measured.
+//
+// Sanity check against the incident objectives: at peak overload System Health
+// must sag below 50 while Customer Success stays well above 70% (failures are
+// rare, transient noise; the story of an incident is latency + backlog, not
+// lost messages).
 func deriveMetrics(s *GameState) {
-	var depthTotal, depthMax int64
-	workers := 0.0
-	for _, q := range s.Queues {
-		depthTotal += q.Depth
-		if q.Depth > depthMax {
-			depthMax = q.Depth
+	// --- 1. Service load ------------------------------------------------
+	// Gateway is the pure inbound tier: load tracks offered traffic.
+	// Orders/Payments/Analytics sit behind queues: load tracks pending work
+	// against their DB's capacity, scaled by any incident multiplier (a 10x DB
+	// latency spike saturates the service without a single new inbound message).
+	reqs := s.Traffic.RatePerSec
+	if s.Sim != nil {
+		loads := make(map[string]float64, len(s.Services))
+		for _, snap := range s.Sim.Snapshots() {
+			if snap.Capacity > 0 {
+				mult := snap.Multiplier
+				if mult < 1 {
+					mult = 1
+				}
+				load := (float64(snap.Pending)/snap.Capacity)*mult + (1-snap.Success)*2
+				if load > loads[snap.Service] {
+					loads[snap.Service] = load
+				}
+			}
+		}
+		for i := range s.Services {
+			sv := &s.Services[i]
+			switch sv.ID {
+			case "gateway":
+				sv.Load = clamp01(reqs / 12000)
+			default:
+				sv.Load = clamp01(loads[sv.ID])
+			}
+		}
+	} else {
+		// No runtime attached (pre-bridge unit use): gateway-only baseline.
+		for i := range s.Services {
+			sv := &s.Services[i]
+			if sv.ID == "gateway" {
+				sv.Load = clamp01(reqs / 12000)
+			} else {
+				sv.Load = 0
+			}
 		}
 	}
-	for _, p := range s.Pools {
-		workers += float64(p.Workers)
+
+	// --- 2. Health drift: sustained overload degrades, recovery heals. ----
+	for i := range s.Services {
+		sv := &s.Services[i]
+		if sv.Load > 0.9 {
+			if sv.Health > 0 {
+				sv.Health -= 1
+			}
+		} else if sv.Health < 100 && sv.Load < 0.7 {
+			sv.Health += 0.5
+			if sv.Health > 100 {
+				sv.Health = 100
+			}
+		}
+		sv.Status = classify(sv.Health)
 	}
 
-	// Latency: baseline service time plus backlog-proportional queuing delay.
-	// More consumers means more total throughput, so delay per unit backlog
-	// shrinks as workers grow. workers is real telemetry (PoolManager + mgmt),
-	// not a fabricated CapPerTick.
-	base := 8 * time.Millisecond
-	delay := time.Duration(float64(depthTotal)/maxf(workers, 1)*50) * time.Millisecond
-	p50 := base + time.Duration(float64(delay)*0.4)
-	p99 := base + time.Duration(float64(delay)*2.2)
+	// --- 3. Real latency percentiles from the worker samplers. ----------
+	// End-to-end latency is the worst of the service links (an order waits on
+	// its payment authorisation), so take the max p50/p99 across queues.
+	var p50, p99 time.Duration
+	if s.Sim != nil {
+		for _, snap := range s.Sim.Snapshots() {
+			if snap.P50 > p50 {
+				p50 = snap.P50
+			}
+			if snap.P99 > p99 {
+				p99 = snap.P99
+			}
+		}
+	}
+	if p50 == 0 {
+		p50 = 8 * time.Millisecond // calm baseline before any work is measured
+	}
 
-	// Success rate degrades as the deepest queue backs up (drops start once a
-	// queue is materially behind).
+	// --- 4. Customer success: real acks / (acks + failures), weighted over
+	// the queues carrying the order flow. --------------------------------
 	success := 1.0
-	if depthMax > 0 {
-		over := float64(depthMax)
-		success = 1.0 - 0.9*(over/(over+400.0))
-	}
-	if success < 0.05 {
-		success = 0.05
+	if s.Sim != nil {
+		var ack, fail int64
+		for _, snap := range s.Sim.Snapshots() {
+			ack += snap.Acked
+			fail += snap.Failed
+		}
+		if ack+fail > 0 {
+			success = float64(ack) / float64(ack+fail)
+		}
 	}
 
-	// System health: worst service health drives it down; degraded queues
-	// further erode it.
-	health := s.Metrics.SystemHealth
+	// --- 5. System health: worst service, eroded further by backlog. ----
 	worst := 100.0
 	for _, sv := range s.Services {
 		if sv.Health < worst {
 			worst = sv.Health
 		}
 	}
-	health = worst
+	var depthMax int64
+	for _, q := range s.Queues {
+		if q.Depth > depthMax {
+			depthMax = q.Depth
+		}
+	}
+	health := worst
 	if depthMax > 200 {
 		health -= (float64(depthMax) - 200) / 20.0
 	}
@@ -60,11 +126,4 @@ func deriveMetrics(s *GameState) {
 	s.Metrics.LatencyP99 = p99
 	s.Metrics.SuccessRate = success
 	s.Metrics.SystemHealth = health
-}
-
-func maxf(a, b float64) float64 {
-	if a > b {
-		return a
-	}
-	return b
 }
