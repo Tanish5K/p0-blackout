@@ -6,28 +6,36 @@ import (
 	"time"
 )
 
-// LatencySampler keeps a rolling window of real per-message processing times
-// measured by the workers. Percentiles are computed from this window, so the
-// p50/p99 shown in metrics are actual observed behaviour — not a guess
-// derived from backlog math.
+// LatencySampler keeps a time-windowed buffer of real per-message processing
+// times. Percentiles are computed over the window so p50/p99 reflect CURRENT
+// pressure — not a stale burst from the first seconds of a run.
+const sampleWindow = 10 * time.Second
+
+type latSample struct {
+	t time.Time
+	d time.Duration
+}
+
+// LatencySampler is a thread-safe time-windowed accumulator.
 type LatencySampler struct {
-	mu   sync.RWMutex
-	buf  []time.Duration
-	next int
+	mu   sync.Mutex
+	buf  []latSample
+	next int // ring insertion index
 	full bool
 }
 
-const samplerSize = 512
+const samplerSize = 4096
 
-// NewLatencySampler builds an empty rolling sampler.
+// NewLatencySampler builds an empty time-windowed sampler.
 func NewLatencySampler() *LatencySampler {
-	return &LatencySampler{buf: make([]time.Duration, samplerSize)}
+	return &LatencySampler{buf: make([]latSample, samplerSize)}
 }
 
-// Record appends one observed processing time.
+// Record appends one observed processing time tagged with the wall-clock time.
 func (s *LatencySampler) Record(d time.Duration) {
+	now := time.Now()
 	s.mu.Lock()
-	s.buf[s.next] = d
+	s.buf[s.next] = latSample{t: now, d: d}
 	s.next = (s.next + 1) % len(s.buf)
 	if s.next == 0 {
 		s.full = true
@@ -35,27 +43,46 @@ func (s *LatencySampler) Record(d time.Duration) {
 	s.mu.Unlock()
 }
 
-// Percentile returns the p-th percentile (0-100) of the current window, or
-// zero if nothing has been recorded yet.
-func (s *LatencySampler) Percentile(p float64) time.Duration {
-	s.mu.RLock()
+// active returns the subset of samples within sampleWindow of now, sorted by
+// duration. Caller holds s.mu.
+func (s *LatencySampler) active(now time.Time) []time.Duration {
+	cutoff := now.Add(-sampleWindow)
 	n := s.next
 	full := s.full
-	sorted := make([]time.Duration, 0, len(s.buf))
-	if full {
-		sorted = append(sorted, s.buf...)
-		sorted = sorted[:len(s.buf)]
-	} else {
-		for i := 0; i < n; i++ {
-			sorted = append(sorted, s.buf[i])
+	total := len(s.buf)
+	if !full {
+		total = n
+	}
+	active := make([]time.Duration, 0, total)
+	for i := 0; i < total; i++ {
+		if full {
+			idx := (n + i) % len(s.buf)
+			if s.buf[idx].t.Before(cutoff) {
+				continue
+			}
+			active = append(active, s.buf[idx].d)
+		} else {
+			if s.buf[i].t.Before(cutoff) {
+				continue
+			}
+			active = append(active, s.buf[i].d)
 		}
 	}
-	s.mu.RUnlock()
+	sort.Slice(active, func(i, j int) bool { return active[i] < active[j] })
+	return active
+}
+
+// Percentile returns the p-th percentile (0-100) of samples recorded in the
+// last 10s, or zero if nothing has been recorded yet.
+func (s *LatencySampler) Percentile(p float64) time.Duration {
+	now := time.Now()
+	s.mu.Lock()
+	sorted := s.active(now)
+	s.mu.Unlock()
 
 	if len(sorted) == 0 {
 		return 0
 	}
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 	idx := int(float64(len(sorted)-1)*p/100 + 0.5)
 	if idx >= len(sorted) {
 		idx = len(sorted) - 1
@@ -63,12 +90,12 @@ func (s *LatencySampler) Percentile(p float64) time.Duration {
 	return sorted[idx]
 }
 
-// Count returns how many samples are currently buffered (for diagnostics).
+// Count returns the number of samples within the active window (for
+// diagnostics).
 func (s *LatencySampler) Count() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if s.full {
-		return len(s.buf)
-	}
-	return s.next
+	now := time.Now()
+	s.mu.Lock()
+	n := len(s.active(now))
+	s.mu.Unlock()
+	return n
 }

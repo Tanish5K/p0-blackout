@@ -52,9 +52,9 @@ type mgmtQueue struct {
 	Unacked       int64 `json:"messages_unacknowledged"`
 	Consumers     int   `json:"consumers"`
 	Stats         *struct {
-		PublishCount uint64 `json:"publish_count"`
-		AckCount     uint64 `json:"ack_count"`
-		DeliverCount uint64 `json:"deliver_count"`
+		PublishCount uint64 `json:"publish"`
+		AckCount     uint64 `json:"ack"`
+		DeliverCount uint64 `json:"deliver"`
 	} `json:"message_stats"`
 }
 

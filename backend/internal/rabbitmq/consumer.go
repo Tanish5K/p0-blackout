@@ -3,10 +3,16 @@ package rabbitmq
 import (
 	"context"
 	"log"
+	"os"
 	"sync"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
+
+// debugLogging gates per-message "received" / "completed & acked" logs.
+// Set BLACKOUT_DEBUG=1 to enable; failures, reconnects, and pool lifecycle
+// are always logged regardless of this flag.
+var debugLogging = os.Getenv("BLACKOUT_DEBUG") == "1"
 
 // Delivery is the consumer message type; a thin alias on the AMQP delivery so
 // pool users don't import amqp directly.
@@ -139,7 +145,9 @@ func (p *WorkerPool) consumeLoop(ctx context.Context) error {
 }
 
 func (p *WorkerPool) handle(ctx context.Context, id int, d amqp.Delivery) {
-	log.Printf("[%s worker %d] received         %q (id=%s)", p.queue, id, d.Body, d.MessageId)
+	if debugLogging {
+		log.Printf("[%s worker %d] received         %q (id=%s)", p.queue, id, d.Body, d.MessageId)
+	}
 	if err := p.handler(ctx, p.queue, d); err != nil {
 		log.Printf("[%s worker %d] handler failed:  %v (nacked, redelivery=%v)",
 			p.queue, id, err, d.Redelivered)
@@ -150,5 +158,7 @@ func (p *WorkerPool) handle(ctx context.Context, id int, d amqp.Delivery) {
 		log.Printf("[%s worker %d] ack failed:      %v", p.queue, id, err)
 		return
 	}
-	log.Printf("[%s worker %d] completed & acked %q (id=%s)", p.queue, id, d.Body, d.MessageId)
+	if debugLogging {
+		log.Printf("[%s worker %d] completed & acked %q (id=%s)", p.queue, id, d.Body, d.MessageId)
+	}
 }

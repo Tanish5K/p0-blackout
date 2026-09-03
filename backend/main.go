@@ -57,6 +57,20 @@ func main() {
 		if err := top.Declare(ctx, ch); err != nil {
 			log.Fatalf("declare topology: %v", err)
 		}
+		// Purge leftover messages so a re-run starts clean. Messages are
+		// published Persistent and the queues are durable, so they survive both
+		// backend and broker restarts. Set BLACKOUT_KEEP_QUEUES=1 to skip
+		// (e.g. resume a prior run).
+		if os.Getenv("BLACKOUT_KEEP_QUEUES") != "1" {
+			for _, q := range reg.WiredQueues() {
+				n, err := ch.QueuePurge(q, false)
+				if err != nil {
+					log.Printf("purge %q: %v", q, err)
+					continue
+				}
+				log.Printf("purged %q (%d messages)", q, n)
+			}
+		}
 		_ = ch.Close()
 	}
 	log.Printf("wired services: %d of %d (stubs: identity, notifications, audit)",

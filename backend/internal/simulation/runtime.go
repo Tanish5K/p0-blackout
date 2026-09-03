@@ -39,12 +39,24 @@ type Runtime struct {
 // NewRuntime wires the runtime to the matching topology: orders.work and
 // analytics.events both fan out of order.created; payments.work only sees
 // payment.auth (see §5.1).
+//
+// DB tuning below is a DEV-FAST pass for iteration speed: a smallish ramp
+// crosses each service's ceiling around ~35-45s so a test run visibly breaks
+// within a minute. This is NOT the final Incident 1 balance — see TODO.md.
+// Intent to preserve: a true incident runs a 5-minute ramp / 8-minute survive
+// window, with the heuristic ceilings well above the calm 200/s baseline so
+// strain builds only near the peak. Original (slower-onset) values, kept for
+// reference:
+//
+//	orders.work:    NewDB(6,  400, 4)  // was ~360/s ceiling -> knee ~5s
+//	analytics.events: NewDB(10, 120, 3) // saturated from t=0 (full fan-out)
+//	payments.work:  NewDB(14, 80,  3)  // ~470/s ceiling -> knee ~6s
 func NewRuntime() *Runtime {
 	rt := &Runtime{
 		dbs: map[string]*DB{
-			serviceOrders:    NewDB(6, 400, 4),
-			serviceAnalytics: NewDB(10, 120, 3),
-			servicePayments:  NewDB(14, 80, 3),
+			serviceOrders:    NewDB(1.2, 3000, 6), // ~1300/s ceiling -> knee ~40s
+			serviceAnalytics: NewDB(0.8, 4000, 4), // ~1700/s ceiling -> knee ~43s
+			servicePayments:  NewDB(1.8, 1500, 3), // ~620/s ceiling -> knee ~47s
 		},
 		queues: make(map[string]*queueState),
 	}

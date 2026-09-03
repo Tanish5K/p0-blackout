@@ -2,6 +2,7 @@ package rabbitmq
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
@@ -46,6 +47,7 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, bo
 	pub := amqp.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp.Persistent,
+		MessageId:    idFromBody(body),
 		Body:         body,
 	}
 	seq := p.channel.GetNextPublishSeqNo()
@@ -92,6 +94,7 @@ func (p *Publisher) PublishBatch(ctx context.Context, exchange, routingKey strin
 		pub := amqp.Publishing{
 			ContentType:  "application/json",
 			DeliveryMode: amqp.Persistent,
+			MessageId:    idFromBody(body),
 			Body:         body,
 		}
 		if err := p.channel.PublishWithContext(ctx, exchange, routingKey, false, false, pub); err != nil {
@@ -147,4 +150,20 @@ func (p *Publisher) Close() {
 	if p.channel != nil && !p.channel.IsClosed() {
 		_ = p.channel.Close()
 	}
+}
+
+type bodyID struct {
+	ID string `json:"id"`
+}
+
+// idFromBody extracts the "id" field from a JSON body so it can be set as the
+// AMQP MessageId, making traceability visible in the management UI and consumer
+// logs. On failure the empty string is returned; AMQP then carries no
+// MessageId.
+func idFromBody(body []byte) string {
+	var b bodyID
+	if err := json.Unmarshal(body, &b); err == nil && b.ID != "" {
+		return b.ID
+	}
+	return ""
 }

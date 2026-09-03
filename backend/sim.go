@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -40,14 +41,27 @@ func newQueueCache() *queueCache {
 
 // runSimulation drives the real simulation: on each 100ms tick it decides what
 // to publish, publishes it for real through the confirmed Publisher, and turns
-// the (real, polled) queue depth back into metrics.
+// the (real, polled) queue depth back into metrics. It also runs the objective
+// evaluator; once a fail triggers or the ramp completes, the generator stops
+// and the final state is left in place (no os.Exit, so the HTTP/WS server and
+// broker connection stay alive for inspection).
 func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.Mgmt, rt *simulation.Runtime) {
 	const seed = 42
+	ramp := 5 * time.Minute
+	// BLACKOUT_RAMP overrides the ramp length for faster dev loops (e.g.
+	// BLACKOUT_RAMP=120s). Hold stays proportionally brief.
+	if v := os.Getenv("BLACKOUT_RAMP"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			ramp = d
+		} else {
+			log.Printf("BLACKOUT_RAMP %q ignored (want a positive duration)", v)
+		}
+	}
 	profile := simulation.StampedeProfile{
 		BaseRate: 200,
 		PeakRate: 10000,
-		Ramp:     5 * time.Minute,
-		Hold:     30 * time.Second,
+		Ramp:     ramp,
+		Hold:     time.Duration(float64(ramp) * 0.1), // ~10% of the ramp as hold
 	}
 	state := simulation.NewGame(seed, profile)
 	state.Sim = rt
@@ -57,10 +71,13 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 
 	go pollQueues(ctx, mgmt, cache, queueNames)
 
+	obj := simulation.NewObjectives()
+	generatorOn := true
+
 	t := time.NewTicker(simulation.TickInterval)
 	defer t.Stop()
 
-	log.Printf("simulation started (seed=%d, tick=%v)", seed, simulation.TickInterval)
+	log.Printf("simulation started (seed=%d, tick=%v, ramp=%s)", seed, simulation.TickInterval, ramp)
 
 	for {
 		select {
@@ -72,11 +89,27 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 			for _, e := range evs {
 				state.Log.Append(e)
 			}
-			bridgePublish(ctx, pub, state)
+			if generatorOn {
+				bridgePublish(ctx, pub, state)
+			}
 			applyCache(cache, state)
 			state.Log.Trim(maxEvents)
-			if state.Tick%10 == 0 {
+			if generatorOn && state.Tick%10 == 0 {
 				logRail(state)
+			}
+
+			// Objective evaluation once per tick. Fail ends the run.
+			if generatorOn {
+				if out := obj.Tick(state); out != nil {
+					logOutcome(state, out)
+					generatorOn = false
+					// Keep the loop running (frozen) so final state stays
+					// inspectable; just stop generating traffic.
+				} else if state.Elapsed >= profile.Ramp+profile.Hold {
+					out := obj.Complete(state)
+					logOutcome(state, out)
+					generatorOn = false
+				}
 			}
 		}
 	}
@@ -269,4 +302,41 @@ func windowTotal(v []int64) int64 {
 		t += x
 	}
 	return t
+}
+
+// logOutcome prints the terminal summary on either a fail or a successful
+// completion: final metrics, survive results, and the last ~20 event-log
+// entries. The generator has already stopped at this point; the frozen final
+// state remains live in the server for inspection.
+func logOutcome(s *simulation.GameState, out *simulation.Outcome) {
+	if out.Failed {
+		log.Printf("=== SCENARIO FAILED === reason: %s", out.FailReason)
+	} else {
+		log.Printf("=== SCENARIO COMPLETED (ramp survived) ===")
+	}
+	log.Printf("ended at t=%s (%d ticks)", out.EndedAt.Round(simulation.TickInterval), out.FinalTicks)
+	log.Printf("final metrics: p50=%s p99=%s success=%.2f%% health=%.0f",
+		out.FinalMetrics.LatencyP50.Round(time.Microsecond),
+		out.FinalMetrics.LatencyP99.Round(time.Microsecond),
+		out.FinalMetrics.SuccessRate*100,
+		out.FinalMetrics.SystemHealth)
+	for _, sv := range out.Survive {
+		status := "met"
+		if !sv.Met {
+			status = "violated"
+		}
+		log.Printf("  objective %-24s %-8s (best streak %d/%d ticks) %s", sv.ID, status, sv.Streak, sv.EndTick, sv.Desc)
+	}
+	log.Printf("last %d events:", minInt(20, s.Log.Len()))
+	for _, e := range s.Log.Tail(20) {
+		log.Printf("  tick=%d t=%s type=%s subject=%s value=%.1f %s",
+			e.Tick, e.Time.Round(simulation.TickInterval), e.Type, e.Subject, e.Value, e.Data)
+	}
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

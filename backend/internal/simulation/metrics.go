@@ -101,7 +101,11 @@ func deriveMetrics(s *GameState) {
 		}
 	}
 
-	// --- 5. System health: worst service, eroded further by backlog. ----
+	// --- 5. System health: worst service, layered with only mild depth pressure.
+	// The old (depthMax-200)/20 penalty eroded health straight to 0 from sheer
+	// backlog; System Health should hover in the 50-100 band during the
+	// "endangered but not yet failed" window so "System Health > 50%" is a
+	// meaningful line to defend. Depth now costs at most ~10 points, capped.
 	worst := 100.0
 	for _, sv := range s.Services {
 		if sv.Health < worst {
@@ -115,8 +119,12 @@ func deriveMetrics(s *GameState) {
 		}
 	}
 	health := worst
-	if depthMax > 200 {
-		health -= (float64(depthMax) - 200) / 20.0
+	if depthMax > 2000 {
+		penalty := (float64(depthMax) - 2000) / 500.0
+		if penalty > 10 {
+			penalty = 10
+		}
+		health -= penalty
 	}
 	if health < 0 {
 		health = 0
