@@ -12,9 +12,13 @@ import (
 	"blackout/internal/api"
 	"blackout/internal/rabbitmq"
 	"blackout/internal/simulation"
+
+	"github.com/joho/godotenv"
 )
 
 func main() {
+	_ = godotenv.Load() // load backend/.env if present; no error if missing
+
 	addr := os.Getenv("BLACKOUT_ADDR")
 	if addr == "" {
 		addr = ":8080"
