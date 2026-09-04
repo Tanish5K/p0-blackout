@@ -37,8 +37,8 @@ type ServiceReg interface {
 
 // ServiceState is the minimal service view the action handler reads.
 type ServiceState struct {
-	ID     string
-	Wired  bool
+	ID      string
+	Wired   bool
 	Workers int // for scale_workers delta calculation
 }
 
@@ -57,20 +57,20 @@ func NewActionHandler(
 	// Dispatch table: action name → handler function.
 	type handlerFn func(IncomingMessage) ActionResult
 	handlers := map[string]handlerFn{
-		"scale_workers":      handleScaleWorkers(pm),
-		"pause_service":      handlePauseService(reg),
-		"resume_service":     handleResumeService(reg),
-		"toggle_analytics":   handleToggleAnalytics(reg),
-		"restart_worker":     stubHandler("restart_worker"),
-		"set_ack_policy":     stubHandler("set_ack_policy"),
-		"set_retry_policy":   stubHandler("set_retry_policy"),
-		"route_to_dlq":       stubHandler("route_to_dlq"),
-		"set_exchange_type":  stubHandler("set_exchange_type"),
-		"add_binding":        stubHandler("add_binding"),
-		"remove_binding":     stubHandler("remove_binding"),
-		"set_priority":       stubHandler("set_priority"),
+		"scale_workers":       handleScaleWorkers(pm),
+		"pause_service":       handlePauseService(reg),
+		"resume_service":      handleResumeService(reg),
+		"toggle_analytics":    handleToggleAnalytics(reg),
+		"restart_worker":      stubHandler("restart_worker"),
+		"set_ack_policy":      stubHandler("set_ack_policy"),
+		"set_retry_policy":    stubHandler("set_retry_policy"),
+		"route_to_dlq":        stubHandler("route_to_dlq"),
+		"set_exchange_type":   stubHandler("set_exchange_type"),
+		"add_binding":         stubHandler("add_binding"),
+		"remove_binding":      stubHandler("remove_binding"),
+		"set_priority":        stubHandler("set_priority"),
 		"set_processing_mode": stubHandler("set_processing_mode"),
-		"use_freeze_frame":   stubHandler("use_freeze_frame"),
+		"use_freeze_frame":    stubHandler("use_freeze_frame"),
 	}
 
 	var mu sync.Mutex // protects event log append

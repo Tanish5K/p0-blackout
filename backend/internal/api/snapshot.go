@@ -9,10 +9,10 @@ import (
 
 // Snapshot is the server-to-client state broadcast matching §4.2.
 type Snapshot struct {
-	Type     string            `json:"type"`     // always "snapshot"
+	Type     string            `json:"type"` // always "snapshot"
 	Tick     int64             `json:"tick"`
-	Clock    string            `json:"clock"`    // "02:17:34"
-	Phase    string            `json:"phase"`    // "running" | "ended"
+	Clock    string            `json:"clock"` // "02:17:34"
+	Phase    string            `json:"phase"` // "running" | "ended"
 	Services []ServiceSnapshot `json:"services"`
 	Queues   []QueueSnapshot   `json:"queues"`
 	Pools    []PoolSnapshot    `json:"pools"`
@@ -42,9 +42,9 @@ type PoolSnapshot struct {
 }
 
 type MetricsSnapshot struct {
-	SystemHealth float64        `json:"systemHealth"`
-	SuccessRate  float64        `json:"successRate"`
-	LatencyMs    LatencyMs      `json:"latencyMs"`
+	SystemHealth float64   `json:"systemHealth"`
+	SuccessRate  float64   `json:"successRate"`
+	LatencyMs    LatencyMs `json:"latencyMs"`
 }
 
 type LatencyMs struct {
@@ -54,13 +54,13 @@ type LatencyMs struct {
 
 // serviceNames maps service IDs to display names.
 var serviceNames = map[string]string{
-	"gateway":     "Gateway",
-	"orders":      "Orders",
-	"payments":    "Payments",
-	"analytics":   "Analytics",
-	"identity":    "Identity",
+	"gateway":       "Gateway",
+	"orders":        "Orders",
+	"payments":      "Payments",
+	"analytics":     "Analytics",
+	"identity":      "Identity",
 	"notifications": "Notifications",
-	"audit":       "Audit",
+	"audit":         "Audit",
 }
 
 // SnapshotFromState builds a Snapshot from the current GameState.
