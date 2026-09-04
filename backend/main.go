@@ -100,9 +100,12 @@ func main() {
 	go pm.Run(ctx)
 	defer pm.Stop()
 
+	hub, router := api.NewRouter(origin)
+	go hub.Run(ctx)
+
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.NewRouter(origin),
+		Handler:           router,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	go func() {
@@ -112,11 +115,12 @@ func main() {
 		}
 	}()
 
-	// Phase 2 bridge: the simulation is the traffic generator. It publishes its
+	// Phase 3 bridge: the simulation is the traffic generator. It publishes its
 	// decided traffic for real and reads real queue depth back from RabbitMQ's
-	// management API
+	// management API. The Hub broadcasts snapshots at 10Hz and dispatches
+	// player actions.
 	mgmt := rabbitmq.NewMgmt(mgmtURL, "lumen", "lumen")
-	go runSimulation(ctx, pub, mgmt, rt)
+	go runSimulation(ctx, pub, mgmt, rt, hub, pm, reg)
 
 	<-ctx.Done()
 	log.Println("shutting down…")

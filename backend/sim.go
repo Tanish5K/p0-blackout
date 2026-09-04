@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"blackout/internal/api"
 	"blackout/internal/rabbitmq"
 	"blackout/internal/simulation"
 	"blackout/pkg/events"
@@ -45,7 +46,7 @@ func newQueueCache() *queueCache {
 // evaluator; once a fail triggers or the ramp completes, the generator stops
 // and the final state is left in place (no os.Exit, so the HTTP/WS server and
 // broker connection stay alive for inspection).
-func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.Mgmt, rt *simulation.Runtime) {
+func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.Mgmt, rt *simulation.Runtime, hub *api.Hub, pm *rabbitmq.PoolManager, reg *rabbitmq.Registry) {
 	const seed = 42
 	ramp := 5 * time.Minute
 	// BLACKOUT_RAMP overrides the ramp length for faster dev loops (e.g.
@@ -74,6 +75,11 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 	obj := simulation.NewObjectives()
 	generatorOn := true
 
+	// Phase 3: wire action handler and snapshot state.
+	var prevSnap *api.Snapshot
+	actionHandler := api.NewActionHandler(pm, &registryAdapter{reg}, state.Log, func() int64 { return state.Tick })
+	hub.SetActionHandler(actionHandler)
+
 	t := time.NewTicker(simulation.TickInterval)
 	defer t.Stop()
 
@@ -97,6 +103,14 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 			if generatorOn && state.Tick%10 == 0 {
 				logRail(state)
 			}
+
+			// Phase 3: broadcast snapshot every tick (10Hz).
+			snap := api.SnapshotFromState(state, !generatorOn)
+			delta := api.Delta(prevSnap, &snap)
+			if data, err := api.MarshalSnapshot(delta); err == nil {
+				hub.Broadcast(data)
+			}
+			prevSnap = &snap
 
 			// Objective evaluation once per tick. Fail ends the run.
 			if generatorOn {
@@ -339,4 +353,25 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// registryAdapter wraps *rabbitmq.Registry to satisfy the api.ServiceReg
+// interface without importing the rabbitmq package into the api package.
+type registryAdapter struct {
+	reg *rabbitmq.Registry
+}
+
+func (a *registryAdapter) Get(id string) *api.ServiceState {
+	svc := a.reg.Get(id)
+	if svc == nil {
+		return nil
+	}
+	return &api.ServiceState{
+		ID:    svc.ID,
+		Wired: svc.Wired,
+	}
+}
+
+func (a *registryAdapter) SetWired(id string, wired bool) bool {
+	return a.reg.SetWired(id, wired)
 }

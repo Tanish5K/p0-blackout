@@ -65,38 +65,36 @@ const (
 
 // ServiceState is one of the Lumen subsystems in the ops room.
 type ServiceState struct {
-	ID     string
-	Load   float64 // 0..1 utilisation
-	Health float64 // 0..100
-	Status ServiceStatus
+	ID     string        `json:"id"`
+	Load   float64       `json:"load"`   // 0..1 utilisation
+	Health float64       `json:"health"` // 0..100
+	Status ServiceStatus `json:"status"`
 }
 
 // QueueState is one durable work/event queue.
 type QueueState struct {
-	Name     string
-	Depth    int64
-	InFlight int64
-	Unacked  int64
-	RateIn   float64 // rolling window, per second
-	RateOut  float64 // rolling window, per second
+	Name     string  `json:"id"`
+	Depth    int64   `json:"depth"`
+	InFlight int64   `json:"inFlight"`
+	Unacked  int64   `json:"unacked"`
+	RateIn   float64 `json:"rateIn"`  // rolling window, per second
+	RateOut  float64 `json:"rateOut"` // rolling window, per second
 }
 
 // PoolState is a consumer pool attached to a queue. Workers (consumer count) is
 // fed from real RabbitMQ telemetry once the sim is bridged; the fake CapPerTick
 // drain was removed because real consumers own how fast queues empty.
 type PoolState struct {
-	Queue     string
-	Workers   int
-	Processed int64
-	Failures  int64
+	Queue   string `json:"queue"`
+	Workers int    `json:"workers"`
 }
 
 // Metrics are the derived operational numbers surfaced to the ops rail.
 type Metrics struct {
-	LatencyP50   time.Duration
-	LatencyP99   time.Duration
-	SuccessRate  float64
-	SystemHealth float64
+	LatencyP50   time.Duration `json:"-"`
+	LatencyP99   time.Duration `json:"-"`
+	SuccessRate  float64       `json:"successRate"`
+	SystemHealth float64       `json:"systemHealth"`
 }
 
 // NewGame builds a fresh, seeded GameState for a profile.

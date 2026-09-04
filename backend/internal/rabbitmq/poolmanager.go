@@ -135,3 +135,31 @@ func (m *PoolManager) PoolCount() int {
 	defer m.mu.Unlock()
 	return len(m.pools)
 }
+
+// Scale restarts the pool for the given queue with a new worker count.
+// Returns an error if the queue is unknown.
+func (m *PoolManager) Scale(queue string, workers int) error {
+	if workers < 1 {
+		workers = 1
+	}
+	m.mu.Lock()
+	// Update the count for reconcile.
+	m.counts[queue] = workers
+	// Stop the existing pool if running.
+	if entry, ok := m.pools[queue]; ok {
+		entry.cancel()
+		delete(m.pools, queue)
+		<-entry.done
+	}
+	m.mu.Unlock()
+	// Reconcile will start a new pool with the updated count.
+	m.reconcile()
+	return nil
+}
+
+// Workers returns the configured worker count for a queue (0 if unknown).
+func (m *PoolManager) Workers(queue string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.counts[queue]
+}
