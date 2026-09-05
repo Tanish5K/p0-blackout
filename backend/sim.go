@@ -104,8 +104,11 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 				logRail(state)
 			}
 
-			// Phase 3: broadcast snapshot every tick (10Hz).
+			// Phase 4: broadcast snapshot every tick (10Hz). Events are per-tick
+			// only (not the full log tail) so the client event tape can append
+			// directly without dedup.
 			snap := api.SnapshotFromState(state, !generatorOn)
+			snap.Events = evs
 			delta := api.Delta(prevSnap, &snap)
 			if data, err := api.MarshalSnapshot(delta); err == nil {
 				hub.Broadcast(data)

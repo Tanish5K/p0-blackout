@@ -1,21 +1,49 @@
+import { useState } from 'react'
 import { useGameState } from './hooks/useGameState'
+import { useTick } from './hooks/useTick'
+import { StatusRail } from './components/StatusRail'
+import { SystemMap } from './components/SystemMap'
+import { Inspector } from './components/Inspector'
+import { EventTape } from './components/EventTape'
 
 export default function App() {
   const conn = useGameState()
+  const display = useTick(conn.status === 'connected' ? conn.snapshot : null)
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+
+  // The map renders interpolated (smooth) state; the inspector and tape
+  // read the authoritative merged snapshot from the WS.
+  const mapSnapshot = display ?? conn.snapshot
 
   return (
     <main className="app">
-      <header className="status-rail">
-        <h1>P0-BLACKOUT</h1>
-        <span className={`conn pill ${conn.status}`}>{conn.status}</span>
-      </header>
-      <section className="system-map">
+      <StatusRail
+        status={conn.status}
+        error={conn.error}
+        snapshot={conn.snapshot}
+      />
+
+      <section className="map-area">
         {conn.status === 'connected' ? (
-          <p className="placeholder">Backend connected. Game state arrives in a later phase.</p>
+          <SystemMap
+            snapshot={mapSnapshot}
+            onSelect={setSelectedId}
+            selectedId={selectedId}
+          />
         ) : (
-          <p className="placeholder">{conn.error ?? 'Connecting…'}</p>
+          <div className="placeholder">
+            {conn.status === 'connecting' ? 'Connecting to backend…' : 'Disconnected — reconnecting…'}
+          </div>
         )}
+
+        <Inspector
+          snapshot={conn.snapshot}
+          selectedId={selectedId}
+          onClose={() => setSelectedId(null)}
+        />
       </section>
+
+      <EventTape events={conn.snapshot.events} />
     </main>
   )
 }

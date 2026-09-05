@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"blackout/internal/simulation"
+	"blackout/pkg/events"
 )
 
 // Snapshot is the server-to-client state broadcast matching §4.2.
@@ -17,6 +18,10 @@ type Snapshot struct {
 	Queues   []QueueSnapshot   `json:"queues"`
 	Pools    []PoolSnapshot    `json:"pools"`
 	Metrics  MetricsSnapshot   `json:"metrics"`
+	// Events carries only the events emitted during this tick (not the log
+	// tail). The client appends them to its event tape; overlapping windows
+	// would require client dedup, so this stays per-tick.
+	Events []events.Event `json:"events"`
 }
 
 type ServiceSnapshot struct {
@@ -87,6 +92,12 @@ func SnapshotFromState(s *simulation.GameState, ended bool) Snapshot {
 			Status: string(sv.Status),
 		}
 	}
+
+	// §5.2 stub nodes: Identity, Notifications and Audit are visible on the
+	// map from run one but have no wired topology until their incident. They
+	// report a static idle state so the frontend renders them without needing
+	// a client-side registry.
+	snap.Services = append(snap.Services, stubServiceSnapshots()...)
 
 	snap.Queues = make([]QueueSnapshot, len(s.Queues))
 	for i, q := range s.Queues {
@@ -204,4 +215,20 @@ func formatElapsed(d interface{ Seconds() float64 }) string {
 	m := (sec % 3600) / 60
 	s := sec % 60
 	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+}
+
+// stubServiceSnapshots returns the 3 idle §5.2 stub services that sit on the
+// map from run one but have no wired topology.
+var stubServiceIDs = []string{"identity", "notifications", "audit"}
+
+func stubServiceSnapshots() []ServiceSnapshot {
+	out := make([]ServiceSnapshot, len(stubServiceIDs))
+	for i, id := range stubServiceIDs {
+		out[i] = ServiceSnapshot{
+			ID:     id,
+			Name:   serviceNames[id],
+			Status: "idle",
+		}
+	}
+	return out
 }
