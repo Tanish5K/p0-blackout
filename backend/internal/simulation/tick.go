@@ -1,6 +1,7 @@
 package simulation
 
 import (
+	"fmt"
 	"time"
 
 	"blackout/pkg/events"
@@ -55,11 +56,13 @@ func Tick(s *GameState, dt time.Duration) []events.Event {
 	deriveMetrics(s)
 
 	// Emit a metric event every N ticks so the terminal shows a moving rail.
+	// Data carries the health reading so the postmortem timeline can reconstruct
+	// when System Health crossed its floors.
 	if s.Tick%10 == 0 {
 		evs = append(evs, events.Event{
 			Tick: s.Tick, Time: s.Elapsed, Type: "metric", Subject: "rail",
 			Value: s.Metrics.LatencyP99.Seconds() * 1000,
-			Data:  "",
+			Data:  fmt.Sprintf("health=%.1f p99=%.0fms", s.Metrics.SystemHealth, float64(s.Metrics.LatencyP99.Milliseconds())),
 		})
 	}
 

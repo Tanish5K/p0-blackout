@@ -1,6 +1,8 @@
-import { useEffect, useCallback, useReducer } from 'react'
+import { useEffect, useCallback, useReducer, useRef } from 'react'
 import type {
+  ActionMessage,
   ConnectionState,
+  RunAction,
   SnapshotMessage,
   ServerMessage,
 } from '../types/game'
@@ -52,15 +54,18 @@ const MAX_ATTEMPTS = 20
 
 /**
  * Opens a WebSocket, merges incoming snapshots into a single authoritative
- * merged snapshot, and exposes connection status. Auto-reconnects on drop
- * with exponential back-off (2-10s).
+ * merged snapshot, and exposes connection status plus a stable runAction that
+ * broadcasts a player action (scale, pause, sync toggle…) over the live socket.
+ * Auto-reconnects on drop with exponential back-off (2-10s).
  */
-export function useGameState(): ConnectionState {
+export function useGameState(): ConnectionState & { runAction: RunAction } {
   const [state, dispatch] = useReducer(reducer, INIT)
+  const wsRef = useRef<WebSocket | null>(null)
 
   const connect = useCallback((attempt: number) => {
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
     const ws = new WebSocket(`${protocol}://${window.location.host}/ws`)
+    wsRef.current = ws
 
     ws.onopen = () => {
       dispatch({ type: 'OPEN' })
@@ -88,6 +93,7 @@ export function useGameState(): ConnectionState {
     }
 
     ws.onclose = () => {
+      if (wsRef.current === ws) wsRef.current = null
       dispatch({ type: 'CLOSE' })
       // Auto-reconnect with capped back-off
       const delay = Math.min(RECONNECT_MS * (attempt + 1), 10000)
@@ -106,5 +112,12 @@ export function useGameState(): ConnectionState {
     return () => cleanup?.()
   }, [connect])
 
-  return state
+  const runAction = useCallback<RunAction>((action, payload) => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    const msg: ActionMessage = { type: 'action', action, payload: payload ?? {} }
+    ws.send(JSON.stringify(msg))
+  }, [])
+
+  return { ...state, runAction }
 }

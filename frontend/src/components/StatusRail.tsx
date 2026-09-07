@@ -1,4 +1,4 @@
-import type { MergedSnapshot, ConnectionState } from '../types/game'
+import type { MergedSnapshot, ConnectionState, ObjectiveSnapshot } from '../types/game'
 import { formatPct } from '../lib/snapshot'
 
 interface StatusRailProps {
@@ -29,12 +29,33 @@ export function StatusRail({ status, error, snapshot }: StatusRailProps) {
         <Metric label="tick" value={`${snapshot.tick}`} />
       </div>
 
+      <div className="rail-objectives">{(snapshot.objectives ?? []).map((o) => <Objective o={o} key={o.id} />)}</div>
+
       <span className={`pill conn ${status}`}>
         {status === 'connected' ? 'live' : status === 'connecting' ? 'connecting…' : 'offline'}
       </span>
       {error && <span className="pill conn error">{error}</span>}
     </header>
   )
+}
+
+function Objective({ o }: { o: ObjectiveSnapshot }) {
+  const display = o.role === 'survive'
+    ? `${fmtClock(o.current)} / ${fmtClock(o.target)}`
+    : `${Math.round(o.current)}% of ${Math.round(o.target)}%`
+  return (
+    <span className={`obj ${o.role} ${o.met ? 'met' : ''}`}>
+      <span className="obj-label">{o.label}</span>
+      <span className="obj-val">{display}</span>
+    </span>
+  )
+}
+
+function fmtClock(sec: number): string {
+  const s = Math.floor(Math.max(0, sec))
+  const m = Math.floor(s / 60)
+  const r = s % 60
+  return `${m}:${r < 10 ? '0' : ''}${r}`
 }
 
 function Metric({ label, value, accent }: { label: string; value: string; accent?: string }) {

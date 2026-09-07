@@ -4,22 +4,28 @@ Not a full roadmap — just things that surfaced during implementation and need
 remembering. Each item includes enough context to revisit without re-reading the
 full source.
 
-## Incident 1 balance (the real dev target)
+## Incident 1 balance (PLAYTEST PASS 1)
 
-The `NewRuntime()` DB tuning in `runtime.go` is currently a dev-fast pass
-designed to make the stampede visibly break within ~35-45s of a 5-min ramp.
-The real Incident 1 balance assumes:
+The committed defaults in `runtime.go` target the real incident:
 
-- **Ramp:** 5 minutes (200 → 10,000 req/s linear)
-- **Hold:** 8 minutes after ramp peak
-- **Service ceilings well above the 200/s calm baseline** so strain only
-  builds near the peak — the operator must respond during the final minutes,
-  not at t=20s
-- Original slower-onset values kept in comments inside `runtime.go`:
-  orders.NewDB(6,400,4), analytics.NewDB(10,120,3), payments.NewDB(14,80,3)
-- When the dev-fast values are ready to be replaced, also revisit `maxFail`
-  in `db.go` (currently 1% cap) — may need a higher ceiling for the real
-  Incident 1 to make failures visible enough during the endure window.
+- **Ramp:** 5 minutes (200 → 10,000 req/s linear); `BLACKOUT_RAMP` overrides
+  the ramp portion only for dev loops.
+- **Survive:** the window is a fixed 8:00 from t=0 — **Hold = Survive − Ramp**
+  — so a compressed dev ramp still exercises the full survive objective.
+- **Ceilings sit far above the 200/s calm baseline** so strain only builds near
+  the peak; scaling to 20 workers can still cope at peak. Playing nothing by
+  t≈6-7 minutes should lose.
+
+These are **PLAYTEST PASS 1**: verify by playing the run a dozen times and tune
+the `NewDB` slopes to match the intended severity curve. Notes:
+
+- `BLACKOUT_FAST_DB=1` reproduces the old dev-fast trio (knee ~35-45s) for
+  quick tape/UI iteration — intentionally breaks far too early for real play.
+- `maxFail` in `db.go` is still 1% cap. The customer-success floor (≤70% fail)
+  is defensive today; if playtest shows success can't approach 70% during the
+  endure window, that's the knob to raise.
+- The original slower-onset comment values are gone; if the final balance needs
+  a different shape, the current defaults are the tuning baseline.
 
 ## StampedeProfile decay after hold
 
@@ -63,11 +69,12 @@ body could be constructed with the ID already available in the caller, and
 the ID threaded into `PublishBatch` as an explicit parameter instead of
 parsed.
 
-## Run terminal state — not frozen yet
+## Run terminal state — now frozen
 
-After an outcome (fail or success), `generatorOn` goes false and the tick
-loop keeps running: depth drains as workers finish, the management API keeps
-being polled, and the HTTP server stays live. The console summary is logged
-once. The next step is to store the final `Outcome` on `GameState` (or a
-separate postmortem state) so the WebSocket can broadcast it to the frontend
-when Phase 4 lands.
+Since Phase 5, the driver stores the final `Outcome` + `Timeline` on
+`GameState` and broadcasts them in the terminal snapshot, then returns from
+`runSimulation` — the tick loop stops, the console summary logs once, and the
+HTTP/WS server stays alive for inspection. Remaining: `Outcome.FinalTicks` and
+the streak fields on `SurviveResult` are recorded but only `FailReason` /
+`EndedAtMs` / final metrics / timeline are serialised today; surface the per-
+objective streaks in the postmortem UI later if the beats feel thin.

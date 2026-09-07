@@ -23,11 +23,16 @@ const (
 
 // Objective is one scored goal for a scenario.
 type Objective struct {
-	ID            string
-	Desc          string
-	Role          ObjectiveRole
-	Check         func(*GameState) bool // true = met (for survive) / violated (for fail)
-	DebounceTicks int                   // consecutive ticks the condition must hold before it takes effect
+	ID    string
+	Label string
+	Desc  string
+	Role  ObjectiveRole
+	Check func(*GameState) bool // true = met (for survive) / violated (for fail)
+	// Metric returns the live value shown in the objectives strip (health %,
+	// success %, survive progress in seconds).
+	Metric        func(*GameState) float64
+	Target        float64
+	DebounceTicks int // consecutive ticks the condition must hold before it takes effect
 }
 
 // SurviveResult reports whether a survive objective held across the whole run.
@@ -37,6 +42,17 @@ type SurviveResult struct {
 	Met     bool
 	Streak  int // longest consecutive-tick streak where it held (survive) or was violated (fail)
 	EndTick int64
+}
+
+// ObjectiveStatus is the live, per-objective view broadcast in every snapshot
+// so the rail can show pass/fail state while the incident is running.
+type ObjectiveStatus struct {
+	ID      string  `json:"id"`
+	Label   string  `json:"label"`
+	Role    string  `json:"role"`    // "fail" | "survive"
+	Current float64 `json:"current"` // live value (Metric)
+	Target  float64 `json:"target"`
+	Met     bool    `json:"met"`
 }
 
 // Outcome is the terminal decision of a scenario: the run ended because a fail
@@ -63,7 +79,9 @@ type Objectives struct {
 	ended     bool
 }
 
-// NewObjectives builds the Incident 1 objective set.
+// NewObjectives builds the Incident 1 objective set (PLAN §7: "must meet ALL").
+// System Health > 50 and Customer Success > 70 are fail floors; the incident is
+// survived by riding the full 8:00 window ("Survive 8:00").
 func NewObjectives() *Objectives {
 	o := &Objectives{
 		failIdx:   make(map[string]int),
@@ -71,14 +89,42 @@ func NewObjectives() *Objectives {
 		maxStreak: make(map[string]int),
 	}
 	o.items = []Objective{
-		// Fail: system health held at/below the floor long enough.
 		{
 			ID:            "system-health-floor",
-			Desc:          "System Health must not stay at or below 50 for 3 consecutive ticks",
+			Label:         "System Health",
+			Desc:          "System Health must stay above 50%",
 			Role:          RoleFail,
 			DebounceTicks: 3,
+			Metric:        func(s *GameState) float64 { return s.Metrics.SystemHealth },
+			Target:        50,
 			Check: func(s *GameState) bool {
 				return s.Metrics.SystemHealth <= 50
+			},
+		},
+		{
+			ID:            "customer-success-floor",
+			Label:         "Customer Success",
+			Desc:          "Customer Success must stay above 70%",
+			Role:          RoleFail,
+			DebounceTicks: 3,
+			Metric:        func(s *GameState) float64 { return s.Metrics.SuccessRate * 100 },
+			Target:        70,
+			Check: func(s *GameState) bool {
+				return s.Metrics.SuccessRate*100 <= 70
+			},
+		},
+		{
+			ID:            "survive",
+			Label:         "Survive 8:00",
+			Desc:          "Ride out the full surge window",
+			Role:          RoleSurvive,
+			DebounceTicks: 1,
+			Metric:        func(s *GameState) float64 { return s.Elapsed.Seconds() },
+			Target:        IncidentSurviveDuration.Seconds(),
+			// Held while the survive window has not expired. Inclusive so the
+			// completing tick (elapsed == 480s exactly) still counts as held.
+			Check: func(s *GameState) bool {
+				return s.Elapsed <= IncidentSurviveDuration
 			},
 		},
 	}
@@ -88,6 +134,30 @@ func NewObjectives() *Objectives {
 		}
 	}
 	return o
+}
+
+// Status returns the live objective strip for the current snapshot.
+func (o *Objectives) Status(s *GameState) []ObjectiveStatus {
+	out := make([]ObjectiveStatus, 0, len(o.items))
+	for i := range o.items {
+		it := &o.items[i]
+		cur := it.Metric(s)
+		role := "fail"
+		if it.Role == RoleSurvive {
+			role = "survive"
+		}
+		// Live "met": a fail floor reads met when NOT currently violated; the
+		// survive clock reads met once the full window has been ridden.
+		met := !it.Check(s)
+		if it.Role == RoleSurvive {
+			met = cur >= it.Target
+		}
+		out = append(out, ObjectiveStatus{
+			ID: it.ID, Label: it.Label, Role: role,
+			Current: cur, Target: it.Target, Met: met,
+		})
+	}
+	return out
 }
 
 // Tick updates streak state for every objective and returns a fail outcome if

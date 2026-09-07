@@ -18,9 +18,13 @@ type Snapshot struct {
 	Queues   []QueueSnapshot   `json:"queues"`
 	Pools    []PoolSnapshot    `json:"pools"`
 	Metrics  MetricsSnapshot   `json:"metrics"`
-	// Events carries only the events emitted during this tick (not the log
-	// tail). The client appends them to its event tape; overlapping windows
-	// would require client dedup, so this stays per-tick.
+	// Objectives is the live objective strip (fail floors + survive clock).
+	Objectives []ObjectiveSnapshot `json:"objectives"`
+	// Outcome appears once the run ends: terminal verdict for the postmortem.
+	Outcome *OutcomeSnapshot `json:"outcome,omitempty"`
+	// Events carries the whole log delta since the last broadcast (tick traffic
+	// AND player action events, keyed by sequence). The client appends them to
+	// its event tape and dedups by tick.
 	Events []events.Event `json:"events"`
 }
 
@@ -30,6 +34,32 @@ type ServiceSnapshot struct {
 	Load   float64 `json:"load"`
 	Health float64 `json:"health"`
 	Status string  `json:"status"`
+	// Wired mirrors the registry's live-MQ flag: paused services read false so
+	// the frontend can show pause/resume control state.
+	Wired bool `json:"wired"`
+	// Synchronous reflects the orders path's processing mode; only wired
+	// services toggle it, stubs always report false.
+	Synchronous bool `json:"synchronous"`
+}
+
+type ObjectiveSnapshot struct {
+	ID      string  `json:"id"`
+	Label   string  `json:"label"`
+	Role    string  `json:"role"` // "fail" | "survive"
+	Current float64 `json:"current"`
+	Target  float64 `json:"target"`
+	Met     bool    `json:"met"`
+}
+
+type OutcomeSnapshot struct {
+	Failed    bool     `json:"failed"`
+	Reason    string   `json:"reason,omitempty"`
+	EndedAtMs int64    `json:"endedAtMs"`
+	Health    float64  `json:"health"`
+	Success   float64  `json:"success"`
+	P50Ms     float64  `json:"p50Ms"`
+	P99Ms     float64  `json:"p99Ms"`
+	Timeline  []string `json:"timeline"`
 }
 
 type QueueSnapshot struct {
@@ -85,11 +115,13 @@ func SnapshotFromState(s *simulation.GameState, ended bool) Snapshot {
 	snap.Services = make([]ServiceSnapshot, len(s.Services))
 	for i, sv := range s.Services {
 		snap.Services[i] = ServiceSnapshot{
-			ID:     sv.ID,
-			Name:   serviceNames[sv.ID],
-			Load:   sv.Load,
-			Health: sv.Health,
-			Status: string(sv.Status),
+			ID:          sv.ID,
+			Name:        serviceNames[sv.ID],
+			Load:        sv.Load,
+			Health:      sv.Health,
+			Status:      string(sv.Status),
+			Wired:       sv.Wired,
+			Synchronous: sv.Synchronous,
 		}
 	}
 
@@ -116,6 +148,34 @@ func SnapshotFromState(s *simulation.GameState, ended bool) Snapshot {
 		snap.Pools[i] = PoolSnapshot{
 			Queue:   p.Queue,
 			Workers: p.Workers,
+		}
+	}
+
+	if s.Objectives != nil {
+		snap.Objectives = make([]ObjectiveSnapshot, 0, 3)
+		for _, st := range s.Objectives.Status(s) {
+			snap.Objectives = append(snap.Objectives, ObjectiveSnapshot{
+				ID:      st.ID,
+				Label:   st.Label,
+				Role:    st.Role,
+				Current: st.Current,
+				Target:  st.Target,
+				Met:     st.Met,
+			})
+		}
+	}
+
+	if s.Outcome != nil {
+		m := s.Outcome.FinalMetrics
+		snap.Outcome = &OutcomeSnapshot{
+			Failed:    s.Outcome.Failed,
+			Reason:    s.Outcome.FailReason,
+			EndedAtMs: s.Outcome.EndedAt.Milliseconds(),
+			Health:    m.SystemHealth,
+			Success:   m.SuccessRate,
+			P50Ms:     float64(m.LatencyP50.Microseconds()) / 1000.0,
+			P99Ms:     float64(m.LatencyP99.Microseconds()) / 1000.0,
+			Timeline:  s.Timeline,
 		}
 	}
 
@@ -171,7 +231,9 @@ func servicesEqual(a, b []ServiceSnapshot) bool {
 		return false
 	}
 	for i := range a {
-		if a[i].Load != b[i].Load || a[i].Health != b[i].Health || a[i].Status != b[i].Status {
+		if a[i].Load != b[i].Load || a[i].Health != b[i].Health ||
+			a[i].Status != b[i].Status || a[i].Wired != b[i].Wired ||
+			a[i].Synchronous != b[i].Synchronous {
 			return false
 		}
 	}
@@ -227,6 +289,8 @@ func stubServiceSnapshots() []ServiceSnapshot {
 		out[i] = ServiceSnapshot{
 			ID:     id,
 			Name:   serviceNames[id],
+			Health: 100,
+			Load:   0,
 			Status: "idle",
 		}
 	}

@@ -20,6 +20,8 @@ export interface SnapshotMessage {
   queues?: QueueSnapshot[]
   pools?: PoolSnapshot[]
   metrics?: MetricsSnapshot
+  objectives?: ObjectiveSnapshot[]
+  outcome?: OutcomeSnapshot
   events?: BackendEvent[]
 }
 
@@ -35,6 +37,12 @@ export interface ServiceSnapshot {
   load: number
   health: number
   status: ServiceStatus
+  // Wired=false means the service is paused (or, for stubs, never live): its
+  // controls switch to resume and its mode toggle is disabled.
+  wired?: boolean
+  // Synchronous reflects the orders path's processing mode (Incident 1's
+  // sync/async toggle).
+  synchronous?: boolean
 }
 
 export interface QueueSnapshot {
@@ -62,8 +70,31 @@ export interface MetricsSnapshot {
   latencyMs: LatencyMs
 }
 
+/* ── Objectives + terminal outcome (Phase 5) ─────────────────────── */
+
+export interface ObjectiveSnapshot {
+  id: string
+  label: string
+  role: 'fail' | 'survive'
+  current: number
+  target: number
+  met: boolean
+}
+
+export interface OutcomeSnapshot {
+  failed: boolean
+  reason?: string
+  endedAtMs: number
+  health: number
+  success: number
+  p50Ms: number
+  p99Ms: number
+  timeline: string[]
+}
+
 export interface BackendEvent {
   tick: number
+  seq?: number
   time: number  // nanoseconds since run start
   type: 'request' | 'publish' | 'route' | 'consume' | 'ack'
     | 'fail' | 'action' | 'metric' | 'state'
@@ -82,6 +113,8 @@ export interface MergedSnapshot {
   queues: QueueSnapshot[]
   pools: PoolSnapshot[]
   metrics: MetricsSnapshot
+  objectives: ObjectiveSnapshot[]
+  outcome?: OutcomeSnapshot
   events: BackendEvent[]
 }
 
@@ -94,6 +127,16 @@ export interface ConnectionState {
 }
 
 /* ── Player actions (Phase 5) ────────────────────────────────────── */
+
+export type ActionPayload = Record<string, number | string | boolean>
+
+export interface ActionMessage {
+  type: 'action'
+  action: string
+  payload: ActionPayload
+}
+
+export type RunAction = (action: string, payload?: ActionPayload) => void
 
 export interface ActionResponse {
   ok: boolean

@@ -2,6 +2,7 @@ package rabbitmq
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 )
@@ -65,7 +66,9 @@ func (m *PoolManager) reconcile() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Start any desired queue that has no pool yet.
+	// Start any desired queue that has no pool yet. desired already comes from
+	// WiredQueues, so unwired/stub queues are skipped here by construction; the
+	// Scale guard is the second (tested) line of defence.
 	for _, q := range desired {
 		if _, ok := m.pools[q]; ok {
 			continue
@@ -137,8 +140,12 @@ func (m *PoolManager) PoolCount() int {
 }
 
 // Scale restarts the pool for the given queue with a new worker count.
-// Returns an error if the queue is unknown.
+// Returns an error if the queue is unknown (never declares one) or is owned by
+// an unwired service — stub services must not gain workers.
 func (m *PoolManager) Scale(queue string, workers int) error {
+	if !m.reg.HasWiredQueue(queue) {
+		return fmt.Errorf("unknown or unwired queue: %s", queue)
+	}
 	if workers < 1 {
 		workers = 1
 	}

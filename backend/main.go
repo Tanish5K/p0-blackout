@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"os"
@@ -15,6 +16,18 @@ import (
 
 	"github.com/joho/godotenv"
 )
+
+// sentAtMillis extracts the generator's sent-at timestamp ({"ts": millis})
+// from a message body, returning ok=false for bodies without one.
+func sentAtMillis(body []byte) (time.Time, bool) {
+	var m struct {
+		Ts int64 `json:"ts"`
+	}
+	if err := json.Unmarshal(body, &m); err != nil || m.Ts == 0 {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(m.Ts), true
+}
 
 func main() {
 	_ = godotenv.Load() // load backend/.env if present; no error if missing
@@ -93,7 +106,17 @@ func main() {
 		"analytics.events": 2,
 		"payments.work":    2,
 	}
+
+	// gatewayTimed wraps the work handler so the ORDER path's publish→ack round
+	// trip lands in Runtime.Gateway: the customer-visible latency the simulation
+	// reads in sync mode. The age is computed against the sent-at stamp the
+	// generator embeds in each body, so queue wait + processing are both real.
 	handler := func(ctx context.Context, queue string, d rabbitmq.Delivery) error {
+		if queue == "orders.work" {
+			if t, ok := sentAtMillis(d.Body); ok {
+				rt.Gateway.Record(time.Since(t))
+			}
+		}
 		return simulation.Work(ctx, rt, queue)
 	}
 	pm := rabbitmq.NewPoolManager(broker, reg, workerCount, handler)

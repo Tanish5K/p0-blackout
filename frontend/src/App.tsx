@@ -5,9 +5,11 @@ import { StatusRail } from './components/StatusRail'
 import { SystemMap } from './components/SystemMap'
 import { Inspector } from './components/Inspector'
 import { EventTape } from './components/EventTape'
+import { Postmortem } from './components/Postmortem'
 
 export default function App() {
   const conn = useGameState()
+  const { runAction } = conn
   const display = useTick(conn.status === 'connected' ? conn.snapshot : null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
@@ -40,10 +42,19 @@ export default function App() {
           snapshot={conn.snapshot}
           selectedId={selectedId}
           onClose={() => setSelectedId(null)}
+          onAction={runAction}
         />
       </section>
 
       <EventTape events={conn.snapshot.events} />
+
+      {conn.snapshot.outcome && (
+        <Postmortem
+          outcome={conn.snapshot.outcome}
+          clock={conn.snapshot.clock}
+          onClose={() => undefined}
+        />
+      )}
     </main>
   )
 }

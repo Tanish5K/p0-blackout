@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,7 +20,7 @@ import (
 const (
 	mgmtVhost       = "/"
 	mgmtPollEvery   = time.Second // ~every 10 ticks; matches the 10Hz broadcast cadence
-	maxEvents       = 5000
+	maxEvents       = 30000       // full 8-min run ≈ 19k events: keeps the whole timeline buildable
 	maxPublishRetry = 5
 )
 
@@ -47,10 +50,23 @@ func newQueueCache() *queueCache {
 // and the final state is left in place (no os.Exit, so the HTTP/WS server and
 // broker connection stay alive for inspection).
 func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.Mgmt, rt *simulation.Runtime, hub *api.Hub, pm *rabbitmq.PoolManager, reg *rabbitmq.Registry) {
-	const seed = 42
+	// Deterministic demo mode: BLACKOUT_SEED reproduces a run exactly. Default
+	// 42 gives the same incident every cold start (Chaos-Mode seeds build on
+	// this later).
+	var seed int64 = 42
+	if v := os.Getenv("BLACKOUT_SEED"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n != 0 {
+			seed = n
+		} else {
+			log.Printf("BLACKOUT_SEED %q ignored (want a non-zero integer)", v)
+		}
+	}
+
+	// Ramp defaults to 5 minutes; BLACKOUT_RAMP overrides only the ramp portion
+	// for faster dev loops. The survive window stays fixed at the real 8:00, so
+	// Hold = Survive − Ramp: a dev ramp of 120s still exercises the full
+	// 8-minute survive objective, just with a compressed build-up.
 	ramp := 5 * time.Minute
-	// BLACKOUT_RAMP overrides the ramp length for faster dev loops (e.g.
-	// BLACKOUT_RAMP=120s). Hold stays proportionally brief.
 	if v := os.Getenv("BLACKOUT_RAMP"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			ramp = d
@@ -58,11 +74,16 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 			log.Printf("BLACKOUT_RAMP %q ignored (want a positive duration)", v)
 		}
 	}
+	survive := simulation.IncidentSurviveDuration
+	hold := survive - ramp
+	if hold < 0 {
+		hold = 0
+	}
 	profile := simulation.StampedeProfile{
 		BaseRate: 200,
 		PeakRate: 10000,
 		Ramp:     ramp,
-		Hold:     time.Duration(float64(ramp) * 0.1), // ~10% of the ramp as hold
+		Hold:     hold,
 	}
 	state := simulation.NewGame(seed, profile)
 	state.Sim = rt
@@ -72,18 +93,27 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 
 	go pollQueues(ctx, mgmt, cache, queueNames)
 
-	obj := simulation.NewObjectives()
 	generatorOn := true
 
-	// Phase 3: wire action handler and snapshot state.
+	// Phase 5: snapshot carrier. Events are broadcast as a cursor over the
+	// shared log (tick traffic AND player action events), not as the tick's own
+	// emit list, so the live event tape shows player interventions immediately.
 	var prevSnap *api.Snapshot
-	actionHandler := api.NewActionHandler(pm, &registryAdapter{reg}, state.Log, func() int64 { return state.Tick })
-	hub.SetActionHandler(actionHandler)
+	var lastLogSeq uint64
+
+// Action log events are stamped with the CURRENT tick. They share the log delta
+// with that tick's traffic and arrive after it (same broadcast), so the client
+// dedup (append only events with tick > last-seen tick), which keys off the
+// previous message's LAST event, keeps the whole sequence.
+adapter := &registryAdapter{reg: reg, state: state}
+actionHandler := api.NewActionHandler(pm, adapter, state.Log, func() int64 { return state.Tick })
+hub.SetActionHandler(actionHandler)
 
 	t := time.NewTicker(simulation.TickInterval)
 	defer t.Stop()
 
-	log.Printf("simulation started (seed=%d, tick=%v, ramp=%s)", seed, simulation.TickInterval, ramp)
+	log.Printf("simulation started (seed=%d, ramp=%s, hold=%s, survive=8:00, fastDB=%s)",
+		seed, ramp, hold, os.Getenv("BLACKOUT_FAST_DB"))
 
 	for {
 		select {
@@ -99,34 +129,44 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 				bridgePublish(ctx, pub, state)
 			}
 			applyCache(cache, state)
+			adapter.syncWired(state)
 			state.Log.Trim(maxEvents)
 			if generatorOn && state.Tick%10 == 0 {
 				logRail(state)
 			}
 
-			// Phase 4: broadcast snapshot every tick (10Hz). Events are per-tick
-			// only (not the full log tail) so the client event tape can append
-			// directly without dedup.
+			// Objective evaluation: a fail trips the debounced floor; otherwise
+			// the run completes the moment the 8:00 survive window elapses.
+			var out *simulation.Outcome
+			if generatorOn {
+				out = state.Objectives.Tick(state)
+				if out == nil && state.Elapsed >= survive {
+					out = state.Objectives.Complete(state)
+				}
+				if out != nil {
+					state.Outcome = out
+					state.Timeline = buildTimeline(state, out)
+					generatorOn = false
+				}
+			}
+
+			// Broadcast every tick (10Hz). Events are the whole log delta since
+			// the last broadcast; the client appends and dedups by tick.
 			snap := api.SnapshotFromState(state, !generatorOn)
-			snap.Events = evs
+			snap.Events = state.Log.After(lastLogSeq)
+			lastLogSeq = state.Log.Seq()
 			delta := api.Delta(prevSnap, &snap)
 			if data, err := api.MarshalSnapshot(delta); err == nil {
 				hub.Broadcast(data)
 			}
 			prevSnap = &snap
 
-			// Objective evaluation once per tick. Fail ends the run.
-			if generatorOn {
-				if out := obj.Tick(state); out != nil {
-					logOutcome(state, out)
-					generatorOn = false
-					// Keep the loop running (frozen) so final state stays
-					// inspectable; just stop generating traffic.
-				} else if state.Elapsed >= profile.Ramp+profile.Hold {
-					out := obj.Complete(state)
-					logOutcome(state, out)
-					generatorOn = false
-				}
+			if out != nil {
+				// Terminal freeze: the final state (outcome + timeline) was just
+				// broadcast; stop the tick loop. The HTTP/WS server and broker
+				// connection stay alive for inspection.
+				logOutcome(state, out)
+				return
 			}
 		}
 	}
@@ -181,11 +221,14 @@ func publishWithRetry(ctx context.Context, pub *rabbitmq.Publisher, exchange, ke
 }
 
 // makeBodies builds the message payloads for one batch. Each carries a short
-// id so the broker UI and any later causal tracing can tell them apart.
+// id so the broker UI and any later causal tracing can tell them apart, plus a
+// sent-at millisecond timestamp the consumer path reads to measure the real
+// publish→ack round trip (the gateway's sync-mode latency).
 func makeBodies(n int64, kind string, tick int64) [][]byte {
 	bodies := make([][]byte, 0, n)
+	now := time.Now().UnixMilli()
 	for i := int64(0); i < n; i++ {
-		body := []byte(fmt.Appendf(nil, `{"id":"%s-%d-%d","kind":"%s"}`, kind, tick, i, kind))
+		body := []byte(fmt.Appendf(nil, `{"id":"%s-%d-%d","kind":"%s","ts":%d}`, kind, tick, i, kind, now))
 		bodies = append(bodies, body)
 	}
 	return bodies
@@ -359,9 +402,12 @@ func minInt(a, b int) int {
 }
 
 // registryAdapter wraps *rabbitmq.Registry to satisfy the api.ServiceReg
-// interface without importing the rabbitmq package into the api package.
+// interface without importing the rabbitmq package into the api package. It
+// also exposes the simulation's own GameState services so the sync/async flag
+// (which lives in the simulation, not in RabbitMQ) can be toggled.
 type registryAdapter struct {
-	reg *rabbitmq.Registry
+	reg   *rabbitmq.Registry
+	state *simulation.GameState
 }
 
 func (a *registryAdapter) Get(id string) *api.ServiceState {
@@ -369,12 +415,152 @@ func (a *registryAdapter) Get(id string) *api.ServiceState {
 	if svc == nil {
 		return nil
 	}
-	return &api.ServiceState{
+	out := &api.ServiceState{
 		ID:    svc.ID,
 		Wired: svc.Wired,
 	}
+	for i := range a.state.Services {
+		if a.state.Services[i].ID == id {
+			out.Synchronous = a.state.Services[i].Synchronous
+			break
+		}
+	}
+	return out
 }
 
 func (a *registryAdapter) SetWired(id string, wired bool) bool {
 	return a.reg.SetWired(id, wired)
+}
+
+func (a *registryAdapter) SetSynchronous(id string, sync bool) bool {
+	for i := range a.state.Services {
+		if a.state.Services[i].ID == id {
+			if a.state.Services[i].Synchronous == sync {
+				return false
+			}
+			a.state.Services[i].Synchronous = sync
+			return true
+		}
+	}
+	return false
+}
+
+// syncWired refreshes each simulation service's Wired flag from the live
+// registry, so snapshots (and the frontend pause/resume controls) reflect
+// player pauses/resumes that the bridge applies broker-side.
+func (a *registryAdapter) syncWired(s *simulation.GameState) {
+	for i := range s.Services {
+		svc := a.reg.Get(s.Services[i].ID)
+		s.Services[i].Wired = svc != nil && svc.Wired
+	}
+}
+
+// buildTimeline assembles the playable postmortem: a short, human-readable
+// sequence of beats derived by filtering and reformatting the event log.
+// Deliberately template-based (this is a dump, not narrative generation).
+func buildTimeline(s *simulation.GameState, out *simulation.Outcome) []string {
+	beats := make([]string, 0, 15)
+	beats = append(beats, "Surge begins — traffic ramps from 200 to 10,000 req/s")
+
+	var peak float64
+	var peakAt string
+	health70, health50 := false, false
+	var t70, t50 string
+
+	for _, e := range s.Log.After(0) {
+		switch e.Type {
+		case "request":
+			if e.Value > peak {
+				peak = e.Value
+				peakAt = stamp(e.Time)
+			}
+		case "action":
+			beats = append(beats, fmt.Sprintf("%s at %s", playerActionBeats(e.Subject, e.Data), stamp(e.Time)))
+		case "metric":
+			if h, ok := healthIn(e.Data); ok {
+				if !health70 && h < 70 {
+					health70 = true
+					t70 = stamp(e.Time)
+				}
+				if !health50 && h < 50 {
+					health50 = true
+					t50 = stamp(e.Time)
+				}
+			}
+		}
+	}
+
+	if peak >= 10000 {
+		beats = append(beats, fmt.Sprintf("Traffic peaked at ~%.0f req/s (%s)", peak, peakAt))
+	} else if peak >= 1000 {
+		beats = append(beats, fmt.Sprintf("Traffic reached ~%.0f req/s (%s)", peak, peakAt))
+	}
+	if health70 {
+		beats = append(beats, "System Health first dropped below 70% ("+t70+")")
+	}
+	if health50 {
+		beats = append(beats, "System Health first dropped below 50% ("+t50+")")
+	}
+
+	if out.Failed {
+		beats = append(beats, "FAILED — "+out.FailReason)
+	} else {
+		beats = append(beats, "SURVIVED — the surge held; all objectives met")
+	}
+	if len(beats) > 15 {
+		beats = beats[:15]
+	}
+	return beats
+}
+
+// playerActionBeats reformats an action-log event into a narrative beat.
+func playerActionBeats(action, data string) string {
+	svc, delta, mode := "", "", ""
+	if data != "" {
+		var m map[string]any
+		if json.Unmarshal([]byte(data), &m) == nil {
+			if v, ok := m["service"].(string); ok {
+				svc = v
+			}
+			if v, ok := m["delta"].(float64); ok {
+				delta = fmt.Sprintf(" %+.0f", v)
+			}
+			if v, ok := m["mode"].(string); ok {
+				mode = v
+			}
+		}
+	}
+	switch action {
+	case "scale_workers":
+		return "Operator scaled " + svc + " workers" + delta
+	case "pause_service":
+		return "Operator paused " + svc
+	case "resume_service":
+		return "Operator resumed " + svc
+	case "set_processing_mode":
+		return "Operator switched " + svc + " to " + mode + " processing"
+	case "toggle_analytics":
+		return "Operator toggled analytics"
+	default:
+		return "Operator ran " + action
+	}
+}
+
+// stamp formats an elapsed duration as mm:ss for timeline beats.
+func stamp(d time.Duration) string {
+	s := int(d.Seconds())
+	return fmt.Sprintf("%02d:%02d", s/60, s%60)
+}
+
+// healthIn extracts System Health from a rail metric event's Data string of the
+// form "health=61.3 p99=412ms". Returns ok=false when absent.
+func healthIn(data string) (float64, bool) {
+	for _, f := range strings.Fields(data) {
+		if v, ok := strings.CutPrefix(f, "health="); ok {
+			if f, err := strconv.ParseFloat(v, 64); err == nil {
+				return f, true
+			}
+		}
+	}
+	return 0, false
 }

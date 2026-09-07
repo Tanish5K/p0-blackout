@@ -33,6 +33,9 @@ type PoolScaler interface {
 type ServiceReg interface {
 	Get(id string) *ServiceState
 	SetWired(id string, wired bool) bool
+	// SetSynchronous toggles the orders path's processing mode (Incident 1's
+	// sync/async control). The simulation owns the flag; the adapter maps it.
+	SetSynchronous(id string, sync bool) bool
 }
 
 // ServiceState is the minimal service view the action handler reads.
@@ -40,6 +43,9 @@ type ServiceState struct {
 	ID      string
 	Wired   bool
 	Workers int // for scale_workers delta calculation
+	// Synchronous mirrors the simulation's processing-mode flag so the handler
+	// can decide the "already toggled" case before calling SetSynchronous.
+	Synchronous bool
 }
 
 // ActionHandler processes a raw player action message and returns a JSON response.
@@ -69,7 +75,7 @@ func NewActionHandler(
 		"add_binding":         stubHandler("add_binding"),
 		"remove_binding":      stubHandler("remove_binding"),
 		"set_priority":        stubHandler("set_priority"),
-		"set_processing_mode": stubHandler("set_processing_mode"),
+		"set_processing_mode": handleSetProcessingMode(reg),
 		"use_freeze_frame":    stubHandler("use_freeze_frame"),
 	}
 
@@ -209,6 +215,48 @@ func handleToggleAnalytics(reg ServiceReg) func(IncomingMessage) ActionResult {
 			state = "resumed"
 		}
 		log.Printf("action: toggle_analytics → %s", state)
+		return ActionResult{OK: true}
+	}
+}
+
+// handleSetProcessingMode toggles the orders service between its synchronous
+// (Incident 1 ^) and asynchronous (fast-path) processing modes. Orders-only by
+// contract: the payload defaults service=orders and the handler rejects any
+// other service, keeping the mode toggle a single visible control.
+func handleSetProcessingMode(reg ServiceReg) func(IncomingMessage) ActionResult {
+	type payload struct {
+		Service string `json:"service"`
+		Mode    string `json:"mode"`
+	}
+	return func(msg IncomingMessage) ActionResult {
+		var p payload
+		if err := json.Unmarshal(msg.Payload, &p); err != nil {
+			return ActionResult{OK: false, Error: "invalid payload"}
+		}
+		if p.Service == "" {
+			p.Service = "orders"
+		}
+		if p.Service != "orders" {
+			return ActionResult{OK: false, Error: fmt.Sprintf("processing mode only applies to orders")}
+		}
+		if p.Mode != "sync" && p.Mode != "async" {
+			return ActionResult{OK: false, Error: "mode must be \"sync\" or \"async\""}
+		}
+		svc := reg.Get(p.Service)
+		if svc == nil {
+			return ActionResult{OK: false, Error: fmt.Sprintf("unknown service: %s", p.Service)}
+		}
+		if !svc.Wired {
+			return ActionResult{OK: false, Error: fmt.Sprintf("service %s is not wired", p.Service)}
+		}
+		want := p.Mode == "sync"
+		if svc.Synchronous == want {
+			return ActionResult{OK: false, Error: fmt.Sprintf("orders already running in %s mode", p.Mode)}
+		}
+		if !reg.SetSynchronous(p.Service, want) {
+			return ActionResult{OK: false, Error: "failed to switch processing mode"}
+		}
+		log.Printf("action: set_processing_mode orders → %s", p.Mode)
 		return ActionResult{OK: true}
 	}
 }

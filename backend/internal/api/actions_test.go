@@ -46,7 +46,7 @@ type fakeReg struct {
 
 func newFakeReg() *fakeReg {
 	return &fakeReg{services: map[string]*ServiceState{
-		"orders":        {ID: "orders", Wired: true},
+		"orders":        {ID: "orders", Wired: true, Synchronous: true},
 		"payments":      {ID: "payments", Wired: true},
 		"analytics":     {ID: "analytics", Wired: true},
 		"gateway":       {ID: "gateway", Wired: true},
@@ -73,6 +73,18 @@ func (f *fakeReg) SetWired(id string, wired bool) bool {
 		return false
 	}
 	svc.Wired = wired
+	return true
+}
+
+func (f *fakeReg) SetSynchronous(id string, sync bool) bool {
+	svc, ok := f.services[id]
+	if !ok {
+		return false
+	}
+	if svc.Synchronous == sync {
+		return false
+	}
+	svc.Synchronous = sync
 	return true
 }
 
@@ -296,7 +308,7 @@ func TestAllStubsReturnOK(t *testing.T) {
 	stubs := []string{
 		"restart_worker", "set_ack_policy", "set_retry_policy",
 		"route_to_dlq", "set_exchange_type", "add_binding",
-		"remove_binding", "set_priority", "set_processing_mode",
+		"remove_binding", "set_priority",
 		"use_freeze_frame",
 	}
 	h := newTestHandler(newFakePool(), newFakeReg())
@@ -304,6 +316,111 @@ func TestAllStubsReturnOK(t *testing.T) {
 		r := send(h, IncomingMessage{Type: "action", Action: name})
 		if !r.OK {
 			t.Errorf("stub %q: expected OK, got %+v", name, r)
+		}
+	}
+}
+
+func TestSetProcessingModeToggle(t *testing.T) {
+	reg := newFakeReg()
+	h := newTestHandler(newFakePool(), reg)
+
+	// orders starts synchronous (Incident 1 ^), so first toggle flips async.
+	r := send(h, IncomingMessage{
+		Type:    "action",
+		Action:  "set_processing_mode",
+		Payload: json.RawMessage(`{"mode":"async"}`),
+	})
+	if !r.OK {
+		t.Fatalf("expected OK switching to async, got %+v", r)
+	}
+	if reg.services["orders"].Synchronous {
+		t.Fatal("expected orders to be async after toggle")
+	}
+
+	// Same mode again is a no-op with a clear error.
+	r = send(h, IncomingMessage{
+		Type:    "action",
+		Action:  "set_processing_mode",
+		Payload: json.RawMessage(`{"mode":"async"}`),
+	})
+	if r.OK || r.Error != "orders already running in async mode" {
+		t.Fatalf("expected already-async error, got %+v", r)
+	}
+
+	// Flip back to sync.
+	r = send(h, IncomingMessage{
+		Type:    "action",
+		Action:  "set_processing_mode",
+		Payload: json.RawMessage(`{"service":"orders","mode":"sync"}`),
+	})
+	if !r.OK {
+		t.Fatalf("expected OK switching back to sync, got %+v", r)
+	}
+	if !reg.services["orders"].Synchronous {
+		t.Fatal("expected orders to be sync again")
+	}
+}
+
+func TestSetProcessingModeInvalidMode(t *testing.T) {
+	h := newTestHandler(newFakePool(), newFakeReg())
+	r := send(h, IncomingMessage{
+		Type:    "action",
+		Action:  "set_processing_mode",
+		Payload: json.RawMessage(`{"mode":"bogus"}`),
+	})
+	if r.OK || r.Error != `mode must be "sync" or "async"` {
+		t.Fatalf("expected invalid-mode error, got %+v", r)
+	}
+}
+
+func TestSetProcessingModeRejectsOtherServices(t *testing.T) {
+	h := newTestHandler(newFakePool(), newFakeReg())
+	for _, svc := range []string{"identity", "notifications", "audit", "payments"} {
+		r := send(h, IncomingMessage{
+			Type:    "action",
+			Action:  "set_processing_mode",
+			Payload: json.RawMessage(`{"service":"` + svc + `","mode":"async"}`),
+		})
+		if r.OK || r.Error != "processing mode only applies to orders" {
+			t.Errorf("%s: expected orders-only error, got %+v", svc, r)
+		}
+	}
+}
+
+func TestSetProcessingModeServiceNotWired(t *testing.T) {
+	reg := newFakeReg()
+	reg.services["orders"].Wired = false
+	h := newTestHandler(newFakePool(), reg)
+
+	r := send(h, IncomingMessage{
+		Type:    "action",
+		Action:  "set_processing_mode",
+		Payload: json.RawMessage(`{"mode":"async"}`),
+	})
+	if r.OK || r.Error != "service orders is not wired" {
+		t.Fatalf("expected not-wired error, got %+v", r)
+	}
+}
+
+func TestStubActionsRejected(t *testing.T) {
+	// The three stub services (identity, notifications, audit) must not be
+	// actionable by the incident's live controls: scaling, pausing, or toggling
+	// processing mode all fail. (resume_service remains open on unwired
+	// services by design — it is the same control that re-wires analytics.)
+	h := newTestHandler(newFakePool(), newFakeReg())
+	for _, svc := range []string{"identity", "notifications", "audit"} {
+		for _, a := range []struct {
+			action  string
+			payload string
+		}{
+			{"scale_workers", `{"service":"` + svc + `","delta":1}`},
+			{"pause_service", `{"service":"` + svc + `"}`},
+			{"set_processing_mode", `{"service":"` + svc + `","mode":"async"}`},
+		} {
+			r := send(h, IncomingMessage{Type: "action", Action: a.action, Payload: json.RawMessage(a.payload)})
+			if r.OK {
+				t.Errorf("%s on stub %s must be rejected, got OK", a.action, svc)
+			}
 		}
 	}
 }
@@ -421,7 +538,7 @@ func setupIntTest(t *testing.T) *intTestDeps {
 	pm := rabbitmq.NewPoolManager(broker, reg, counts, handler)
 	go pm.Run(ctx)
 
-	adapter := &regAdapter{reg: reg}
+	adapter := &regAdapter{reg: reg, modes: map[string]bool{"orders": true}}
 	actionLog := events.NewLog()
 	tick := int64(100)
 	actionHandler := NewActionHandler(pm, adapter, actionLog, func() int64 { return tick })
@@ -446,7 +563,8 @@ func (d *intTestDeps) teardown() {
 
 // regAdapter wraps *rabbitmq.Registry to satisfy ServiceReg.
 type regAdapter struct {
-	reg *rabbitmq.Registry
+	reg   *rabbitmq.Registry
+	modes map[string]bool // orders processing-mode flag (simulation-backed in prod)
 }
 
 func (a *regAdapter) Get(id string) *ServiceState {
@@ -455,13 +573,22 @@ func (a *regAdapter) Get(id string) *ServiceState {
 		return nil
 	}
 	return &ServiceState{
-		ID:    svc.ID,
-		Wired: svc.Wired,
+		ID:          svc.ID,
+		Wired:       svc.Wired,
+		Synchronous: a.modes["orders"],
 	}
 }
 
 func (a *regAdapter) SetWired(id string, wired bool) bool {
 	return a.reg.SetWired(id, wired)
+}
+
+func (a *regAdapter) SetSynchronous(id string, sync bool) bool {
+	if a.modes[id] == sync {
+		return false
+	}
+	a.modes[id] = sync
+	return true
 }
 
 // publishTo publishes n test messages straight into a named queue via the
@@ -628,7 +755,8 @@ func TestInt_AllActionsAccepted(t *testing.T) {
 		{"add_binding", `{}`},
 		{"remove_binding", `{}`},
 		{"set_priority", `{}`},
-		{"set_processing_mode", `{}`},
+		{"set_processing_mode", `{"mode":"async"}`},
+		{"set_processing_mode", `{"mode":"sync"}`},
 		{"use_freeze_frame", `{}`},
 	}
 

@@ -25,6 +25,7 @@ export function emptySnapshot(): MergedSnapshot {
     queues: [],
     pools: [],
     metrics: { systemHealth: 0, successRate: 0, latencyMs: { p50: 0, p99: 0 } },
+    objectives: [],
     events: [],
   }
 }
@@ -43,6 +44,8 @@ export function mergeSnapshot(prev: MergedSnapshot, update: SnapshotMessage): Me
       queues: update.queues ?? prev.queues,
       pools: update.pools ?? prev.pools,
       metrics: { ...prev.metrics, ...update.metrics },
+      objectives: update.objectives ?? prev.objectives,
+      outcome: update.outcome ?? prev.outcome,
       events: update.events ?? [],
     }
   }
@@ -58,6 +61,8 @@ export function mergeSnapshot(prev: MergedSnapshot, update: SnapshotMessage): Me
     queues: update.queues ?? prev.queues,
     pools: update.pools ?? prev.pools,
     metrics,
+    objectives: update.objectives ?? prev.objectives,
+    outcome: update.outcome ?? prev.outcome,
     events,
   }
 }
@@ -110,9 +115,11 @@ export function lerpSnapshot(
   const queues = lerpQueues(a.queues, b.queues, c)
   const pools = lerpPools(a.pools, b.pools, c)
   const metrics = lerpMetrics(a.metrics, b.metrics, c)
+  const objectives = b.objectives // live objective strip (never interpolated)
+  const outcome = b.outcome
   const events = b.events // always latest events (never interpolated)
 
-  return { tick, clock, phase, services, queues, pools, metrics, events }
+  return { tick, clock, phase, services, queues, pools, metrics, objectives, outcome, events }
 }
 
 function lerpServices(
@@ -131,6 +138,8 @@ function lerpServices(
       load: lerp(sa.load, sb.load, t),
       health: lerp(sa.health, sb.health, t),
       status: t >= 0.5 ? sb.status : sa.status,
+      wired: t >= 0.5 ? sb.wired : sa.wired,
+      synchronous: t >= 0.5 ? sb.synchronous : sa.synchronous,
     })
   }
   return out
@@ -142,6 +151,8 @@ const STUB_SERVICE: ServiceSnapshot = {
   load: 0,
   health: 100,
   status: 'idle',
+  wired: false,
+  synchronous: false,
 }
 
 function lerpQueues(

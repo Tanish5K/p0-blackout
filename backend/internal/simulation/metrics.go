@@ -1,6 +1,9 @@
 package simulation
 
-import "time"
+import (
+	"math"
+	"time"
+)
 
 // deriveMetrics recomputes service load, health and the operational rail from
 // real worker telemetry ("published - acked" load trackers reconciled against
@@ -37,6 +40,13 @@ func deriveMetrics(s *GameState) {
 			switch sv.ID {
 			case "gateway":
 				sv.Load = clamp01(reqs / 12000)
+				// In sync mode the gateway blocks on the order queue, so its
+				// load must also track real backend pressure — otherwise the
+				// "gateway slow" story hides entirely behind non-gateway load.
+				if ordersSync(s) && s.Sim != nil && s.Sim.Gateway != nil {
+					gp99 := s.Sim.Gateway.Percentile(99)
+					sv.Load = math.Max(sv.Load, clamp01(gp99.Seconds()/0.5))
+				}
 			default:
 				sv.Load = clamp01(loads[sv.ID])
 			}
@@ -69,22 +79,27 @@ func deriveMetrics(s *GameState) {
 		sv.Status = classify(sv.Health)
 	}
 
-	// --- 3. Real latency percentiles from the worker samplers. ----------
-	// End-to-end latency is the worst of the service links (an order waits on
-	// its payment authorisation), so take the max p50/p99 across queues.
+	// --- 3. End-to-end (customer-visible) latency. --------------------
+	// The gateway is the only tier the customer touches. In sync mode it
+	// blocks on the order queue's ack, so p50/p99 come from the real
+	// publish→ack round-trip sampler (which includes queue wait). In async
+	// mode the gateway returns immediately and the cost of the surge shows up
+	// as backlog/depth on the queues instead of latency.
 	var p50, p99 time.Duration
-	if s.Sim != nil {
-		for _, snap := range s.Sim.Snapshots() {
-			if snap.P50 > p50 {
-				p50 = snap.P50
-			}
-			if snap.P99 > p99 {
-				p99 = snap.P99
-			}
+	if ordersSync(s) {
+		if s.Sim != nil && s.Sim.Gateway != nil {
+			p50 = s.Sim.Gateway.Percentile(50)
+			p99 = s.Sim.Gateway.Percentile(99)
 		}
-	}
-	if p50 == 0 {
-		p50 = 8 * time.Millisecond // calm baseline before any work is measured
+		if p50 == 0 {
+			p50 = 8 * time.Millisecond // calm baseline before any samples
+		}
+		if p99 == 0 {
+			p99 = p50
+		}
+	} else {
+		p50 = 1500 * time.Microsecond // ~1.5ms fast-path
+		p99 = 3 * time.Millisecond
 	}
 
 	// --- 4. Customer success: real acks / (acks + failures), weighted over
@@ -134,4 +149,14 @@ func deriveMetrics(s *GameState) {
 	s.Metrics.LatencyP99 = p99
 	s.Metrics.SuccessRate = success
 	s.Metrics.SystemHealth = health
+}
+
+// ordersSync reports whether the orders service runs its synchronous path.
+func ordersSync(s *GameState) bool {
+	for i := range s.Services {
+		if s.Services[i].ID == "orders" {
+			return s.Services[i].Synchronous
+		}
+	}
+	return false
 }

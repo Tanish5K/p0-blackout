@@ -29,11 +29,27 @@ type GameState struct {
 	Pools    []PoolState
 	Metrics  Metrics
 
+	// Objectives owns the scenario objective set (state.driver uses
+	// state.Objectives.Tick/Complete). Kept on the state so snapshot builders
+	// can surface live objective status without a second code path.
+	Objectives *Objectives
+
+	// Outcome and Timeline are set by the driver once a fail tripped or the
+	// survive window completed; the terminal snapshot serialises them.
+	Outcome  *Outcome
+	Timeline []string
+
 	Log *events.Log
 }
 
 // TickInterval is the fixed simulation timestep.
 const TickInterval = 100 * time.Millisecond
+
+// IncidentSurviveDuration is the phase-5 survive window: the whole incident
+// (ramp + hold) must be ridden for this long, counted from t=0. The driver
+// derives Hold = IncidentSurviveDuration − Ramp so a dev-speed ramp override
+// still exercises the true 8:00 objective. Per PLAN.md §7.*: "Survive 8:00".
+const IncidentSurviveDuration = 8 * time.Minute
 
 // TrafficState is the current inbound request load.
 type TrafficState struct {
@@ -69,6 +85,17 @@ type ServiceState struct {
 	Load   float64       `json:"load"`   // 0..1 utilisation
 	Health float64       `json:"health"` // 0..100
 	Status ServiceStatus `json:"status"`
+
+	// Wired mirrors the registry's live-MQ flag (the driver refreshes it each
+	// tick after the bridge applies player pauses/resumes). It reaches the
+	// frontend so pause/resume controls can show their current state.
+	Wired bool `json:"wired"`
+
+	// Synchronous marks the orders path's processing mode (Incident 1's
+	// sync/async toggle). Sync = the gateway blocks on the order queue's ack;
+	// async = fire-and-forget. Only the orders service toggles today; the flag
+	// lives generically on ServiceState so later incidents can reuse it.
+	Synchronous bool `json:"synchronous"`
 }
 
 // QueueState is one durable work/event queue.
@@ -112,6 +139,7 @@ func NewGame(seed int64, profile TrafficProfile) *GameState {
 		Log:     events.NewLog(),
 	}
 	s.resetServices(profile)
+	s.Objectives = NewObjectives()
 	return s
 }
 
@@ -122,10 +150,10 @@ func (s *GameState) Rng() *rand.Rand { return s.rng }
 // the simulation models. Idempotent on construction.
 func (s *GameState) resetServices(profile TrafficProfile) {
 	s.Services = []ServiceState{
-		{ID: "gateway", Load: 0, Health: 100, Status: StatusHealthy},
-		{ID: "orders", Load: 0, Health: 100, Status: StatusHealthy},
-		{ID: "payments", Load: 0, Health: 100, Status: StatusHealthy},
-		{ID: "analytics", Load: 0, Health: 100, Status: StatusHealthy},
+		{ID: "gateway", Load: 0, Health: 100, Status: StatusHealthy, Wired: true},
+		{ID: "orders", Load: 0, Health: 100, Status: StatusHealthy, Wired: true, Synchronous: true},
+		{ID: "payments", Load: 0, Health: 100, Status: StatusHealthy, Wired: true},
+		{ID: "analytics", Load: 0, Health: 100, Status: StatusHealthy, Wired: true},
 	}
 	s.Queues = []QueueState{
 		{Name: "orders.work"},

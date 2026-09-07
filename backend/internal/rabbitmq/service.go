@@ -178,6 +178,25 @@ func (r *Registry) WiredQueues() []string {
 	return out
 }
 
+// HasWiredQueue reports whether queue belongs to a currently-Wired service.
+// Pool-scaling targets fall back here: an unknown or unwired queue must be
+// rejected rather than silently creating workers against a stub service.
+func (r *Registry) HasWiredQueue(queue string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, s := range r.Services {
+		if !s.Wired {
+			continue
+		}
+		for _, q := range s.Topology.Queues {
+			if q.Name == queue {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Subscribe registers a channel that receives a broadcast whenever a Wired
 // flag changes. The channel is buffered(1); slow consumers may miss a change
 // and should reconcile by comparing desired vs actual state on any signal.

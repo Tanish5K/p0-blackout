@@ -1,4 +1,4 @@
-import type { MergedSnapshot } from '../types/game'
+import type { MergedSnapshot, RunAction } from '../types/game'
 import {
   serviceQueueID,
   findQueue,
@@ -12,9 +12,10 @@ interface InspectorProps {
   snapshot: MergedSnapshot
   selectedId: string | null
   onClose: () => void
+  onAction: RunAction
 }
 
-export function Inspector({ snapshot, selectedId, onClose }: InspectorProps) {
+export function Inspector({ snapshot, selectedId, onClose, onAction }: InspectorProps) {
   if (!selectedId) return null
 
   const svc = snapshot.services.find((s) => s.id === selectedId)
@@ -36,6 +37,7 @@ export function Inspector({ snapshot, selectedId, onClose }: InspectorProps) {
   const queueID = serviceQueueID(selectedId)
   const queue = queueID ? findQueue(snapshot.queues, queueID) : undefined
   const pool = queueID ? findPool(snapshot.pools, queueID) : undefined
+  const hasControls = pool !== undefined
 
   return (
     <aside className="inspector">
@@ -83,20 +85,90 @@ export function Inspector({ snapshot, selectedId, onClose }: InspectorProps) {
         </div>
       )}
 
-      {pool && (
+      {hasControls && (
         <div className="inspector-section">
-          <h3>Workers</h3>
+          <h3>Operations</h3>
+
+          {pool && (
+            <div className="stat-row">
+              <span className="stat-label">Workers</span>
+              <span className="stat-value">
+                <span className="workers-count">{pool.workers}</span>
+                <span className="worker-btns">
+                  <button
+                    className="mgmt-btn"
+                    onClick={() => onAction('scale_workers', { service: selectedId, delta: -1 })}
+                    aria-label="Remove a worker"
+                  >
+                    −
+                  </button>
+                  <button
+                    className="mgmt-btn"
+                    onClick={() => onAction('scale_workers', { service: selectedId, delta: 1 })}
+                    aria-label="Add a worker"
+                  >
+                    +
+                  </button>
+                </span>
+              </span>
+            </div>
+          )}
+
+          {selectedId === 'orders' && pool && (
+            <div className="stat-row">
+              <span className="stat-label">Processing</span>
+              <span className="stat-value">
+                <span className={`mode-chip ${svc.synchronous ? 'sync' : 'async'}`}>
+                  {svc.synchronous ? 'sync' : 'async'}
+                </span>
+                <button
+                  className="mgmt-btn"
+                  onClick={() =>
+                    onAction('set_processing_mode', {
+                      service: selectedId,
+                      mode: svc.synchronous ? 'async' : 'sync',
+                    })
+                  }
+                  aria-label="Toggle processing mode"
+                >
+                  toggle
+                </button>
+              </span>
+            </div>
+          )}
+
           <div className="stat-row">
-            <span className="stat-label">Pool size</span>
-            <span className="stat-value">{pool.workers}</span>
+            <span className="stat-label">Connections</span>
+            <span className="stat-value">
+              {svc.wired ? (
+                <button
+                  className="mgmt-btn warn"
+                  onClick={() => onAction('pause_service', { service: selectedId })}
+                  aria-label={`Pause ${svc.name}`}
+                >
+                  pause
+                </button>
+              ) : (
+                <button
+                  className="mgmt-btn ok"
+                  onClick={() => onAction('resume_service', { service: selectedId })}
+                  aria-label={`Resume ${svc.name}`}
+                >
+                  resume
+                </button>
+              )}
+            </span>
           </div>
         </div>
       )}
 
-      {!queue && !pool && (
+      {!hasControls && !selectedId.startsWith('gateway') && (
         <div className="inspector-section stub">
           <p>No queue attached yet</p>
         </div>
+      )}
+      {hasControls && !svc.wired && (
+        <p className="control-hint">Paused — traffic is accumulating in the queue.</p>
       )}
     </aside>
   )

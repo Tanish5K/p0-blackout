@@ -1,6 +1,7 @@
 package simulation
 
 import (
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -34,31 +35,50 @@ type Runtime struct {
 	dbs    map[string]*DB         // service name -> DB
 	queues map[string]*queueState // queue name -> state
 	order  []string               // stable queue iteration order
+
+	// Gateway measures the real publish→ack round trip for the order path
+	// (enqueue wait + worker processing), fed by the bridge wrapper around
+	// Work. It is the customer-visible latency in sync mode. It keeps measuring
+	// physical tail regardless of mode so toggling sync on surfaces real
+	// backend pressure immediately.
+	Gateway *LatencySampler
 }
 
 // NewRuntime wires the runtime to the matching topology: orders.work and
 // analytics.events both fan out of order.created; payments.work only sees
 // payment.auth (see §5.1).
 //
-// DB tuning below is a DEV-FAST pass for iteration speed: a smallish ramp
-// crosses each service's ceiling around ~35-45s so a test run visibly breaks
-// within a minute. This is NOT the final Incident 1 balance — see TODO.md.
-// Intent to preserve: a true incident runs a 5-minute ramp / 8-minute survive
-// window, with the heuristic ceilings well above the calm 200/s baseline so
-// strain builds only near the peak. Original (slower-onset) values, kept for
-// reference:
+// DB tuning: the default preset targets the real incident — a 5-minute ramp to
+// 10,000 req/s with an 8:00 survive window (Hold = survive − Ramp). Ceilings
+// sit far above the calm 200/s baseline so strain builds only in the final
+// minutes, and scaling workers up (cap 20) can still cope near the peak. These
+// numbers are PLAYTEST PASS 1 — expect to retune against human runs (TODO.md).
 //
-//	orders.work:    NewDB(6,  400, 4)  // was ~360/s ceiling -> knee ~5s
-//	analytics.events: NewDB(10, 120, 3) // saturated from t=0 (full fan-out)
-//	payments.work:  NewDB(14, 80,  3)  // ~470/s ceiling -> knee ~6s
+// BLACKOUT_FAST_DB=1 selects the old dev-fast preset (knee ~35-45s) for quick
+// tape/UI iteration with a short BLACKOUT_RAMP; it breaks far too early to be
+// a real scenario.
 func NewRuntime() *Runtime {
-	rt := &Runtime{
-		dbs: map[string]*DB{
+	fast := os.Getenv("BLACKOUT_FAST_DB") == "1"
+
+	var dbs map[string]*DB
+	if fast {
+		dbs = map[string]*DB{
 			serviceOrders:    NewDB(1.2, 3000, 6), // ~1300/s ceiling -> knee ~40s
 			serviceAnalytics: NewDB(0.8, 4000, 4), // ~1700/s ceiling -> knee ~43s
 			servicePayments:  NewDB(1.8, 1500, 3), // ~620/s ceiling -> knee ~47s
-		},
-		queues: make(map[string]*queueState),
+		}
+	} else {
+		dbs = map[string]*DB{
+			serviceOrders:    NewDB(0.6, 6000, 6), // ~5-8k/s ceilings: calm at
+			serviceAnalytics: NewDB(0.5, 8000, 4), // 200/s, pressured at the peak
+			servicePayments:  NewDB(0.9, 5000, 5),
+		}
+	}
+
+	rt := &Runtime{
+		dbs:     dbs,
+		queues:  make(map[string]*queueState),
+		Gateway: NewLatencySampler(),
 	}
 	rt.addQueue("orders.work", serviceOrders)
 	rt.addQueue("analytics.events", serviceAnalytics)
