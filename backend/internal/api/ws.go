@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"net/http"
 	"strings"
@@ -18,6 +19,10 @@ type Hub struct {
 	conns   map[*websocket.Conn]bool
 	origin  string
 	handler func(raw []byte) []byte // action dispatcher, set by sim.go
+	// control handles run-lifecycle messages ({"type":"control","action":...}),
+	// dispatched separately from player actions because control can swap the
+	// run (and therefore the action handler) the dispatcher points at.
+	control func(raw []byte) []byte
 }
 
 // NewRouter creates the Hub and returns the HTTP handler for /ws and /healthz.
@@ -41,6 +46,14 @@ func NewRouter(origin string) (*Hub, http.Handler) {
 // response to send back to the client. Must be called before Run.
 func (h *Hub) SetActionHandler(fn func(raw []byte) []byte) {
 	h.handler = fn
+}
+
+// SetControlHandler registers the function called for run-lifecycle control
+// messages ({"type":"control",...}). Control is dispatched before the action
+// handler so starting/retrying a run (which swaps out the action handler) is
+// always reachable.
+func (h *Hub) SetControlHandler(fn func(raw []byte) []byte) {
+	h.control = fn
 }
 
 // Broadcast sends data to every connected client. Dead connections are
@@ -133,11 +146,24 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read loop: dispatch player actions to the registered handler.
+	// Read loop: dispatch player actions / control messages to their handlers.
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			return
+		}
+		if h.control != nil {
+			var probe struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal(msg, &probe) == nil && probe.Type == "control" {
+				if resp := h.control(msg); resp != nil {
+					if err := conn.WriteMessage(websocket.TextMessage, resp); err != nil {
+						return
+					}
+				}
+				continue
+			}
 		}
 		if h.handler == nil {
 			continue

@@ -6,16 +6,18 @@ import { SystemMap } from './components/SystemMap'
 import { Inspector } from './components/Inspector'
 import { EventTape } from './components/EventTape'
 import { Postmortem } from './components/Postmortem'
+import { StartScreen } from './components/StartScreen'
 
 export default function App() {
   const conn = useGameState()
-  const { runAction } = conn
+  const { runAction, runControl } = conn
   const display = useTick(conn.status === 'connected' ? conn.snapshot : null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
   // The map renders interpolated (smooth) state; the inspector and tape
   // read the authoritative merged snapshot from the WS.
   const mapSnapshot = display ?? conn.snapshot
+  const runStatus = conn.snapshot.runStatus
 
   return (
     <main className="app">
@@ -23,6 +25,7 @@ export default function App() {
         status={conn.status}
         error={conn.error}
         snapshot={conn.snapshot}
+        runControl={runControl}
       />
 
       <section className="map-area">
@@ -48,11 +51,16 @@ export default function App() {
 
       <EventTape events={conn.snapshot.events} />
 
-      {conn.snapshot.outcome && (
+      {runStatus === 'idle' && (
+        <StartScreen status={conn.status} runStatus={runStatus} onStart={() => runControl('start')} />
+      )}
+
+      {runStatus === 'ended' && conn.snapshot.outcome && (
         <Postmortem
           outcome={conn.snapshot.outcome}
           clock={conn.snapshot.clock}
           onClose={() => undefined}
+          onRetry={() => runControl('retry')}
         />
       )}
     </main>

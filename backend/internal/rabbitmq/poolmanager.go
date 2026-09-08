@@ -164,6 +164,23 @@ func (m *PoolManager) Scale(queue string, workers int) error {
 	return nil
 }
 
+// Reset stops every pool and restarts the full set at the given worker counts
+// (not the last scale_workers value). Used by the run controller between
+// incidents so a player's scaling doesn't leak into the next run. Waits for
+// every pool goroutine to exit before returning, so no worker from the old
+// run can be mid-handler while the runtime resets underneath it.
+func (m *PoolManager) Reset(counts map[string]int) {
+	m.Stop()
+	m.mu.Lock()
+	m.counts = make(map[string]int, len(counts))
+	for k, v := range counts {
+		m.counts[k] = v
+	}
+	m.mu.Unlock()
+	m.reconcile()
+	log.Printf("pool manager reset (%d pools at defaults)", len(m.counts))
+}
+
 // Workers returns the configured worker count for a queue (0 if unknown).
 func (m *PoolManager) Workers(queue string) int {
 	m.mu.Lock()

@@ -5,9 +5,10 @@ interface PostmortemProps {
   outcome: OutcomeSnapshot
   clock: string
   onClose: () => void
+  onRetry: () => void
 }
 
-export function Postmortem({ outcome, clock, onClose }: PostmortemProps) {
+export function Postmortem({ outcome, clock, onClose, onRetry }: PostmortemProps) {
   return (
     <div className="postmortem-overlay" role="dialog" aria-modal="true">
       <div className={`postmortem-card ${outcome.failed ? 'failed' : 'survived'}`}>
@@ -46,9 +47,18 @@ export function Postmortem({ outcome, clock, onClose }: PostmortemProps) {
           ))}
         </ol>
 
+        <div className="postmortem-actions">
+          <button className="start-button" onClick={onRetry}>
+            {outcome.failed ? 'Play again' : 'Run it back'}
+          </button>
+          <button className="postmortem-dismiss" onClick={onClose}>
+            Inspect the frozen state
+          </button>
+        </div>
+
         <p className="postmortem-hint">
-          The backend is paused on this final state. Restart it to play again —
-          seed {outcome.endedAtMs > 0 ? 'was deterministic' : ''}.
+          The backend is paused on this final state — pressing Play again
+          restarts the incident with a clean slate.
         </p>
       </div>
     </div>

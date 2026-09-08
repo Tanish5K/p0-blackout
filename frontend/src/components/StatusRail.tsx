@@ -1,13 +1,14 @@
-import type { MergedSnapshot, ConnectionState, ObjectiveSnapshot } from '../types/game'
+import type { MergedSnapshot, ConnectionState, ObjectiveSnapshot, RunControl } from '../types/game'
 import { formatPct } from '../lib/snapshot'
 
 interface StatusRailProps {
   status: ConnectionState['status']
   error?: string
   snapshot: MergedSnapshot
+  runControl: RunControl
 }
 
-export function StatusRail({ status, error, snapshot }: StatusRailProps) {
+export function StatusRail({ status, error, snapshot, runControl }: StatusRailProps) {
   const m = snapshot.metrics
   const latencyP50 = m.latencyMs.p50.toFixed(0)
   const latencyP99 = m.latencyMs.p99.toFixed(0)
@@ -18,6 +19,7 @@ export function StatusRail({ status, error, snapshot }: StatusRailProps) {
         <h1>P0-BLACKOUT</h1>
         <span className="rail-sep">|</span>
         <span className="rail-clock">{snapshot.clock}</span>
+        <span className={`pill run ${snapshot.runStatus}`}>{snapshot.runStatus}</span>
         <span className={`pill phase ${snapshot.phase}`}>{snapshot.phase}</span>
       </div>
 
@@ -30,6 +32,12 @@ export function StatusRail({ status, error, snapshot }: StatusRailProps) {
       </div>
 
       <div className="rail-objectives">{(snapshot.objectives ?? []).map((o) => <Objective o={o} key={o.id} />)}</div>
+
+      {snapshot.runStatus === 'ended' && (
+        <button className="pill pill-btn" onClick={() => runControl('retry')}>
+          play again
+        </button>
+      )}
 
       <span className={`pill conn ${status}`}>
         {status === 'connected' ? 'live' : status === 'connecting' ? 'connecting…' : 'offline'}

@@ -13,6 +13,15 @@ import (
 // Publisher sends messages to an exchange with publisher confirms enabled.
 // Confirms mean we know when the broker has actually taken ownership of a
 // message — essential later when the tick loop must not lose tracked work.
+//
+// Messages are Transient (non-persistent) by design: durable-queue Persistent
+// delivery forces RabbitMQ to fsync every message before confirming, which on
+// a dev/Docker broker makes ack latency multi-millisecond and caps a pool's
+// real throughput far below the DB model's assumptions. Transient removes that
+// disk-bound ceiling so publish→ack latency means queue backlog, not fsync.
+// TRADE-OFF: in-flight messages no longer survive a broker restart — revisit
+// if a later incident (e.g. Incident 2's worker-crash recovery) needs message
+// durability back.
 type Publisher struct {
 	broker *Broker
 
@@ -45,10 +54,9 @@ func (p *Publisher) Publish(ctx context.Context, exchange, routingKey string, bo
 		return err
 	}
 	pub := amqp.Publishing{
-		ContentType:  "application/json",
-		DeliveryMode: amqp.Persistent,
-		MessageId:    idFromBody(body),
-		Body:         body,
+		ContentType: "application/json",
+		MessageId:   idFromBody(body),
+		Body:        body,
 	}
 	seq := p.channel.GetNextPublishSeqNo()
 	err := p.channel.PublishWithContext(ctx, exchange, routingKey, false, false, pub)
@@ -92,10 +100,9 @@ func (p *Publisher) PublishBatch(ctx context.Context, exchange, routingKey strin
 	firstSeq := p.channel.GetNextPublishSeqNo()
 	for _, body := range bodies {
 		pub := amqp.Publishing{
-			ContentType:  "application/json",
-			DeliveryMode: amqp.Persistent,
-			MessageId:    idFromBody(body),
-			Body:         body,
+			ContentType: "application/json",
+			MessageId:   idFromBody(body),
+			Body:        body,
 		}
 		if err := p.channel.PublishWithContext(ctx, exchange, routingKey, false, false, pub); err != nil {
 			p.mu.Unlock()

@@ -2,7 +2,9 @@ import { useEffect, useCallback, useReducer, useRef } from 'react'
 import type {
   ActionMessage,
   ConnectionState,
+  ControlMessage,
   RunAction,
+  RunControl,
   SnapshotMessage,
   ServerMessage,
 } from '../types/game'
@@ -58,7 +60,7 @@ const MAX_ATTEMPTS = 20
  * broadcasts a player action (scale, pause, sync toggle…) over the live socket.
  * Auto-reconnects on drop with exponential back-off (2-10s).
  */
-export function useGameState(): ConnectionState & { runAction: RunAction } {
+export function useGameState(): ConnectionState & { runAction: RunAction; runControl: RunControl } {
   const [state, dispatch] = useReducer(reducer, INIT)
   const wsRef = useRef<WebSocket | null>(null)
 
@@ -119,5 +121,12 @@ export function useGameState(): ConnectionState & { runAction: RunAction } {
     ws.send(JSON.stringify(msg))
   }, [])
 
-  return { ...state, runAction }
+  const runControl = useCallback<RunControl>((action) => {
+    const ws = wsRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    const msg: ControlMessage = { type: 'control', action }
+    ws.send(JSON.stringify(msg))
+  }, [])
+
+  return { ...state, runAction, runControl }
 }

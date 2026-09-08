@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"sync"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -34,6 +35,16 @@ type WorkerPool struct {
 
 	mu   sync.Mutex
 	stop context.CancelFunc
+
+	// Failure-summary state: failures are always surfaced, but as a rate-limited
+	// per-second roll-up rather than one line per dropped message. Per-message
+	// detail stays gated behind BLACKOUT_DEBUG=1 (the established logging split);
+	// this roll-up exists so a failure storm is visible WITHOUT flipping the
+	// flag, not instead of it. Reconnects / pool lifecycle keep their own logs.
+	failMu     sync.Mutex
+	failTotal  uint64
+	failWindow uint64
+	failLogged time.Time
 }
 
 func NewWorkerPool(broker *Broker, top Topology, queue string, workers int, handler Handler) *WorkerPool {
@@ -95,7 +106,13 @@ func (p *WorkerPool) consumeLoop(ctx context.Context) error {
 	}
 
 	// Fair dispatch: one message to each worker before the next round.
-	if err := ch.Qos(p.workers, 0, false); err != nil {
+	//
+	// The prefetch is generous (not "= workers") so the channel pipelines: a
+	// small prefetch makes the whole pool roughly single-threaded, bound by the
+	// ack round-trip instead of the worker's DB work, which silently caps
+	// throughput at ~workers/ack-RTT. With a large prefetch, aggregate drain
+	// scales with worker count and the DB model's latency curve stays honest.
+	if err := ch.Qos(500, 0, false); err != nil {
 		return err
 	}
 
@@ -144,14 +161,30 @@ func (p *WorkerPool) consumeLoop(ctx context.Context) error {
 	return done
 }
 
+// handle runs one delivery through the pool's handler.
 func (p *WorkerPool) handle(ctx context.Context, id int, d amqp.Delivery) {
 	if debugLogging {
 		log.Printf("[%s worker %d] received         %q (id=%s)", p.queue, id, d.Body, d.MessageId)
 	}
 	if err := p.handler(ctx, p.queue, d); err != nil {
-		log.Printf("[%s worker %d] handler failed:  %v (nacked, redelivery=%v)",
-			p.queue, id, err, d.Redelivered)
-		_ = d.Nack(false, true)
+		// Failures are always surfaced, but as a rate-limited per-second
+		// roll-up so a storm stays visible without flooding the console;
+		// per-message detail is gated behind BLACKOUT_DEBUG like the rest of
+		// the routine chatter. This is a SUMMARY, deliberately not a
+		// suppression: it must not be reused to mute a genuinely interesting
+		// failure (e.g. Incident 3's poison-message storm).
+		if debugLogging {
+			log.Printf("[%s worker %d] handler failed:  %v (nacked, redelivery=%v)",
+				p.queue, id, err, d.Redelivered)
+		} else {
+			p.rollFailure()
+		}
+		// Dropped, not requeued: a simulated failure counts exactly once. The
+		// Nack(false, true) that used to be here requeued the message, so a
+		// persistent failure looped forever, re-counted both failed AND (on a
+		// later successful pass) acked, and flooded the log. requeue=false
+		// keeps the loss honest and the counters single-count.
+		_ = d.Nack(false, false)
 		return
 	}
 	if err := d.Ack(false); err != nil {
@@ -161,4 +194,20 @@ func (p *WorkerPool) handle(ctx context.Context, id int, d amqp.Delivery) {
 	if debugLogging {
 		log.Printf("[%s worker %d] completed & acked %q (id=%s)", p.queue, id, d.Body, d.MessageId)
 	}
+}
+
+// rollFailure accounts for one failed handler return and, at most once per
+// second, prints a per-queue summary of how many failures landed.
+func (p *WorkerPool) rollFailure() {
+	p.failMu.Lock()
+	defer p.failMu.Unlock()
+	p.failTotal++
+	p.failWindow++
+	if time.Since(p.failLogged) < time.Second {
+		return
+	}
+	log.Printf("[%s worker] %d failures in the last 1s (total %d): simulated worker failure, message dropped",
+		p.queue, p.failWindow, p.failTotal)
+	p.failWindow = 0
+	p.failLogged = time.Now()
 }

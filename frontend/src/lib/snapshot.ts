@@ -20,7 +20,9 @@ export function emptySnapshot(): MergedSnapshot {
   return {
     tick: 0,
     clock: '--:--:--',
-    phase: 'running',
+    phase: 'idle',
+    runId: 0,
+    runStatus: 'idle',
     services: [],
     queues: [],
     pools: [],
@@ -33,21 +35,15 @@ export function emptySnapshot(): MergedSnapshot {
 /* ── Merge delta into a running merged snapshot ────────────────────── */
 
 export function mergeSnapshot(prev: MergedSnapshot, update: SnapshotMessage): MergedSnapshot {
-  // If the tick went backwards the backend restarted (its tick counter reset);
-  // treat the incoming frame as a fresh run rather than merging over stale state.
+  // A runId change means a retry started: treat the frame as a brand-new run
+  // and WIPE the merged state (events in particular — the old run's tape must
+  // not bleed into the next). The backend resets its tick counter each run
+  // too, so tick going backwards is the fallback signal for older clients.
+  if (update.runId !== undefined && update.runId !== prev.runId) {
+    return freshRun(prev, update)
+  }
   if (update.tick < prev.tick) {
-    return {
-      tick: update.tick,
-      clock: update.clock,
-      phase: update.phase,
-      services: update.services ?? prev.services,
-      queues: update.queues ?? prev.queues,
-      pools: update.pools ?? prev.pools,
-      metrics: { ...prev.metrics, ...update.metrics },
-      objectives: update.objectives ?? prev.objectives,
-      outcome: update.outcome ?? prev.outcome,
-      events: update.events ?? [],
-    }
+    return freshRun(prev, update)
   }
 
   const metrics = mergeMetrics(prev.metrics, update.metrics)
@@ -57,6 +53,8 @@ export function mergeSnapshot(prev: MergedSnapshot, update: SnapshotMessage): Me
     tick: update.tick,
     clock: update.clock,
     phase: update.phase,
+    runId: update.runId ?? prev.runId,
+    runStatus: update.runStatus ?? prev.runStatus,
     services: update.services ?? prev.services,
     queues: update.queues ?? prev.queues,
     pools: update.pools ?? prev.pools,
@@ -64,6 +62,27 @@ export function mergeSnapshot(prev: MergedSnapshot, update: SnapshotMessage): Me
     objectives: update.objectives ?? prev.objectives,
     outcome: update.outcome ?? prev.outcome,
     events,
+  }
+}
+
+// freshRun rebuilds a merged snapshot from a full first frame of a new run.
+// The backend always broadcasts run frames as full snapshots (its first-frame
+// delta is never stripped), so services/queues/objectives come from this
+// message; arrays we can't trust (events) start empty from it alone.
+function freshRun(prev: MergedSnapshot, update: SnapshotMessage): MergedSnapshot {
+  return {
+    tick: update.tick,
+    clock: update.clock,
+    phase: update.phase,
+    runId: update.runId ?? prev.runId + 1,
+    runStatus: update.runStatus ?? prev.runStatus,
+    services: update.services ?? prev.services,
+    queues: update.queues ?? prev.queues,
+    pools: update.pools ?? prev.pools,
+    metrics: mergeMetrics(prev.metrics, update.metrics),
+    objectives: update.objectives ?? [],
+    outcome: update.outcome ?? undefined,
+    events: mergeEvents([], update.events ?? []),
   }
 }
 
@@ -109,6 +128,8 @@ export function lerpSnapshot(
   const tick = b.tick
   const clock = b.clock
   const phase = b.phase
+  const runId = b.runId
+  const runStatus = b.runStatus
 
   // Arrays: lerp in-place, fall back to a if b doesn't carry it
   const services = lerpServices(a.services, b.services, c)
@@ -119,7 +140,7 @@ export function lerpSnapshot(
   const outcome = b.outcome
   const events = b.events // always latest events (never interpolated)
 
-  return { tick, clock, phase, services, queues, pools, metrics, objectives, outcome, events }
+  return { tick, clock, phase, runId, runStatus, services, queues, pools, metrics, objectives, outcome, events }
 }
 
 function lerpServices(

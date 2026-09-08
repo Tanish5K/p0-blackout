@@ -197,6 +197,30 @@ func (r *Registry) HasWiredQueue(queue string) bool {
 	return false
 }
 
+// ResetWired restores every service's Wired flag to its campaign default
+// (WiredIn==0) and notifies subscribers. A paused/resumed service from a prior
+// run must not leak its state into the next run's topology or pool set.
+func (r *Registry) ResetWired() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	changed := false
+	for i := range r.Services {
+		want := r.Services[i].WiredIn == 0
+		if r.Services[i].Wired != want {
+			r.Services[i].Wired = want
+			changed = true
+		}
+	}
+	if changed {
+		for _, sub := range r.subs {
+			select {
+			case sub <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
 // Subscribe registers a channel that receives a broadcast whenever a Wired
 // flag changes. The channel is buffered(1); slow consumers may miss a change
 // and should reconcile by comparing desired vs actual state on any signal.

@@ -6,6 +6,9 @@
 
 /* ── Server → Client messages ────────────────────────────────────── */
 
+export type RunStatus = 'idle' | 'running' | 'ended'
+export type Phase = RunStatus
+
 export interface HelloMessage {
   type: 'hello'
   msg: string
@@ -15,7 +18,13 @@ export interface SnapshotMessage {
   type: 'snapshot'
   tick: number
   clock: string
-  phase: 'running' | 'ended'
+  phase: Phase
+  // runId identifies which run this frame belongs to: it increments on every
+  // start/retry, and the client wipes its merged state the instant it changes.
+  runId?: number
+  // runStatus drives the start-overlay / postmortem gating: "idle" before the
+  // first Start, "running" during play, "ended" once the outcome fired.
+  runStatus?: RunStatus
   services?: ServiceSnapshot[]
   queues?: QueueSnapshot[]
   pools?: PoolSnapshot[]
@@ -108,7 +117,9 @@ export interface BackendEvent {
 export interface MergedSnapshot {
   tick: number
   clock: string
-  phase: 'running' | 'ended'
+  phase: Phase
+  runId: number
+  runStatus: RunStatus
   services: ServiceSnapshot[]
   queues: QueueSnapshot[]
   pools: PoolSnapshot[]
@@ -142,3 +153,12 @@ export interface ActionResponse {
   ok: boolean
   message?: string
 }
+
+/* ── Run lifecycle control (Phase 5: play from the UI) ────────────── */
+
+export interface ControlMessage {
+  type: 'control'
+  action: 'start' | 'retry'
+}
+
+export type RunControl = (action: 'start' | 'retry') => void

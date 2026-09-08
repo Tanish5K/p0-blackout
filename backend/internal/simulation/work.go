@@ -7,11 +7,14 @@ import (
 	"time"
 )
 
-// ErrTransient is returned when simulated processing "fails" — the consumer
-// nacks the message so the broker redelivers it. Failures are rare, transient
-// noise (see DB.FailureChance), never poison-message storms: retry limits and
-// DLQs are Incident 3 tooling, not part of this run.
-var ErrTransient = errors.New("simulated transient service failure")
+// ErrDropped is returned when simulated processing "fails" — the consumer
+// nacks with requeue=false, so the message is LOST, not redelivered. The name
+// is deliberately honest: an injected failure that never recovers on retry is
+// a permanent loss, not a transient error. Failures are rare noise (see
+// DB.FailureChance); the Customer Success objective reads their real cost.
+// Genuine retry/recovery semantics (requeue with capped redeliveries, DLQ) are
+// Incident 3 tooling via set_retry_policy / route_to_dlq, not this run.
+var ErrDropped = errors.New("simulated worker failure: message dropped")
 
 // Work processes a single message from the given queue against its simulated
 // database. This is the real worker loop body: it walks the concurrency
@@ -35,7 +38,7 @@ func Work(ctx context.Context, rt *Runtime, queue string) error {
 	// message does not also get recorded as a latency sample.
 	if rand.Float64() < db.FailureChance(pending) {
 		rt.AddFailed(queue, 1)
-		return ErrTransient
+		return ErrDropped
 	}
 
 	// Latency scales with concurrency and backlog (DB.LatencyMS), plus a small

@@ -14,6 +14,13 @@ type Snapshot struct {
 	Tick     int64             `json:"tick"`
 	Clock    string            `json:"clock"` // "02:17:34"
 	Phase    string            `json:"phase"` // "running" | "ended"
+	// RunID and RunStatus identify which run a snapshot belongs to. RunID
+	// increments every start/retry; clients treat a change as a fresh run and
+	// wipe their merged state (events in particular). RunStatus is
+	// "idle" before the first Start and during the run-ends window, so the
+	// frontend can gate the game behind a start screen.
+	RunID    int64             `json:"runId"`
+	RunStatus string           `json:"runStatus"` // "idle" | "running" | "ended"
 	Services []ServiceSnapshot `json:"services"`
 	Queues   []QueueSnapshot   `json:"queues"`
 	Pools    []PoolSnapshot    `json:"pools"`

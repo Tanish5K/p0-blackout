@@ -75,17 +75,12 @@ func main() {
 			log.Fatalf("declare topology: %v", err)
 		}
 		// Purge leftover messages so a re-run starts clean. Messages are
-		// published Persistent and the queues are durable, so they survive both
-		// backend and broker restarts. Set BLACKOUT_KEEP_QUEUES=1 to skip
-		// (e.g. resume a prior run).
+		// published transient and the queues are durable, but a hard-stopped
+		// backend can still leave an in-flight backlog. Set BLACKOUT_KEEP_QUEUES=1
+		// to skip (e.g. resume a prior run).
 		if os.Getenv("BLACKOUT_KEEP_QUEUES") != "1" {
-			for _, q := range reg.WiredQueues() {
-				n, err := ch.QueuePurge(q, false)
-				if err != nil {
-					log.Printf("purge %q: %v", q, err)
-					continue
-				}
-				log.Printf("purged %q (%d messages)", q, n)
+			if err := purgeQueues(ctx, broker, reg.WiredQueues()); err != nil {
+				log.Printf("initial purge: %v", err)
 			}
 		}
 		_ = ch.Close()
@@ -99,13 +94,9 @@ func main() {
 	}
 	defer pub.Close()
 
-	// Worker counts per wireable work queue (Phase 2: real simulated work).
+	// Runtime carries the detached simulation-only machinery (queue trackers,
+	// load samplers, the sync-gateway latency recorder).
 	rt := simulation.NewRuntime()
-	workerCount := map[string]int{
-		"orders.work":      3,
-		"analytics.events": 2,
-		"payments.work":    2,
-	}
 
 	// gatewayTimed wraps the work handler so the ORDER path's publish→ack round
 	// trip lands in Runtime.Gateway: the customer-visible latency the simulation
@@ -119,7 +110,7 @@ func main() {
 		}
 		return simulation.Work(ctx, rt, queue)
 	}
-	pm := rabbitmq.NewPoolManager(broker, reg, workerCount, handler)
+	pm := rabbitmq.NewPoolManager(broker, reg, defaultWorkerCounts(), handler)
 	go pm.Run(ctx)
 	defer pm.Stop()
 
@@ -141,9 +132,21 @@ func main() {
 	// Phase 3 bridge: the simulation is the traffic generator. It publishes its
 	// decided traffic for real and reads real queue depth back from RabbitMQ's
 	// management API. The Hub broadcasts snapshots at 10Hz and dispatches
-	// player actions.
+	// player actions, plus run-lifecycle control messages.
 	mgmt := rabbitmq.NewMgmt(mgmtURL, "lumen", "lumen")
-	go runSimulation(ctx, pub, mgmt, rt, hub, pm, reg)
+
+	// Incident 1 is now playable from the UI: idle on boot, Started/Retried over
+	// the /ws control channel. BLACKOUT_AUTOSTART=1 preserves the old
+	// boot-and-run behaviour for scripts and smoke tests.
+	controller := NewRunController(ctx, broker, pub, mgmt, rt, hub, pm, reg)
+	hub.SetControlHandler(controller.HandleControl)
+	controller.Boot()
+	if os.Getenv("BLACKOUT_AUTOSTART") == "1" {
+		log.Printf("BLACKOUT_AUTOSTART=1 — starting run immediately")
+		if err := controller.Start(); err != nil {
+			log.Printf("autostart: %v", err)
+		}
+	}
 
 	<-ctx.Done()
 	log.Println("shutting down…")

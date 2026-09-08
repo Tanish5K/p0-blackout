@@ -26,6 +26,14 @@ type queueState struct {
 	sampler *LatencySampler
 	acked   atomic.Int64 // total messages finished successfully
 	failed  atomic.Int64 // total messages failed/nacked
+	// published counts every message handed to the broker (successful
+	// publishes only). acked+failed are the "departed" side of the queue, so
+	// (published − acked − failed) is a self-contained windowed rate source
+	// that does NOT depend on RabbitMQ's management counter retention.
+	published atomic.Int64
+	// prevPub/prevAck are the previous sample's counters for SnapshotRates' deltas.
+	prevPub int64
+	prevAck int64
 }
 
 // Runtime holds everything the workers and the sim need to know about the
@@ -58,25 +66,8 @@ type Runtime struct {
 // tape/UI iteration with a short BLACKOUT_RAMP; it breaks far too early to be
 // a real scenario.
 func NewRuntime() *Runtime {
-	fast := os.Getenv("BLACKOUT_FAST_DB") == "1"
-
-	var dbs map[string]*DB
-	if fast {
-		dbs = map[string]*DB{
-			serviceOrders:    NewDB(1.2, 3000, 6), // ~1300/s ceiling -> knee ~40s
-			serviceAnalytics: NewDB(0.8, 4000, 4), // ~1700/s ceiling -> knee ~43s
-			servicePayments:  NewDB(1.8, 1500, 3), // ~620/s ceiling -> knee ~47s
-		}
-	} else {
-		dbs = map[string]*DB{
-			serviceOrders:    NewDB(0.6, 6000, 6), // ~5-8k/s ceilings: calm at
-			serviceAnalytics: NewDB(0.5, 8000, 4), // 200/s, pressured at the peak
-			servicePayments:  NewDB(0.9, 5000, 5),
-		}
-	}
-
 	rt := &Runtime{
-		dbs:     dbs,
+		dbs:     newDBPreset(os.Getenv("BLACKOUT_FAST_DB") == "1"),
 		queues:  make(map[string]*queueState),
 		Gateway: NewLatencySampler(),
 	}
@@ -85,6 +76,44 @@ func NewRuntime() *Runtime {
 	rt.addQueue("payments.work", servicePayments)
 	rt.order = []string{"orders.work", "analytics.events", "payments.work"}
 	return rt
+}
+
+// newDBPreset builds the DB set for the given tuning preset. Kept separate from
+// NewRuntime and Runtime.Reset so a new run starts with the exact same DBs and
+// the player never carries tuning across incidents.
+func newDBPreset(fast bool) map[string]*DB {
+	if fast {
+		return map[string]*DB{
+			serviceOrders:    NewDB(1.2, 3000, 6), // ~1300/s ceiling -> knee ~40s
+			serviceAnalytics: NewDB(0.8, 4000, 4), // ~1700/s ceiling -> knee ~43s
+			servicePayments:  NewDB(1.8, 1500, 3), // ~620/s ceiling -> knee ~47s
+		}
+	}
+	return map[string]*DB{
+		serviceOrders:    NewDB(0.6, 6000, 6), // ~5-8k/s ceilings: calm at
+		serviceAnalytics: NewDB(0.5, 8000, 4), // 200/s, pressured at the peak
+		servicePayments:  NewDB(0.9, 5000, 5),
+	}
+}
+
+// Reset rebuilds every DB, tracker and sampler into a pristine run state. All
+// workers must be stopped before calling (the controller stops pools first), so
+// no in-flight handler can touch a half-rebuilt runtime.
+func (rt *Runtime) Reset() {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.dbs = newDBPreset(os.Getenv("BLACKOUT_FAST_DB") == "1")
+	for name := range rt.queues {
+		svc := rt.queues[name].service
+		rt.queues[name] = &queueState{
+			service:  svc,
+			tracker:  NewLoadTracker(),
+			sampler:  NewLatencySampler(),
+			prevPub:  0,
+			prevAck:  0,
+		}
+	}
+	rt.Gateway = NewLatencySampler()
 }
 
 func (rt *Runtime) addQueue(name, service string) {
@@ -149,6 +178,7 @@ func (rt *Runtime) AddPublished(queue string, n int) {
 	rt.mu.RUnlock()
 	if ok {
 		t.tracker.AddPublished(int64(n))
+		t.published.Add(int64(n))
 	}
 }
 
@@ -232,6 +262,46 @@ type QueueSnapshot struct {
 	Success    float64
 	Capacity   float64
 	Multiplier float64
+}
+
+// QueueRates is a per-second in/out rate for one queue over a window.
+type QueueRates struct {
+	In  float64
+	Out float64
+}
+
+// SnapshotRates returns per-queue publish/consume rates over the given window,
+// computed from the runtime's OWN cumulative counters (published vs
+// acked+failed). This is deliberately not based on the management API's
+// message_stats: those reset on RabbitMQ's own retention schedule, so diffing
+// them against a fixed 1s poll interval produced rates off by the retention
+// period. Windowed tracker deltas are exact by construction.
+func (rt *Runtime) SnapshotRates(interval time.Duration) map[string]QueueRates {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	secs := interval.Seconds()
+	if secs <= 0 {
+		secs = 1
+	}
+	out := make(map[string]QueueRates, len(rt.order))
+	for name, q := range rt.queues {
+		p := q.published.Load()
+		d := q.acked.Load() + q.failed.Load()
+		r := QueueRates{
+			In:  float64(p-q.prevPub) / secs,
+			Out: float64(d-q.prevAck) / secs,
+		}
+		if r.In < 0 {
+			r.In = 0
+		}
+		if r.Out < 0 {
+			r.Out = 0
+		}
+		q.prevPub = p
+		q.prevAck = d
+		out[name] = r
+	}
+	return out
 }
 
 // Snapshots returns one snapshot per queue, sorted by queue name for a stable

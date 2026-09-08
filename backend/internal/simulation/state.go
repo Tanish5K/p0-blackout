@@ -160,10 +160,14 @@ func (s *GameState) resetServices(profile TrafficProfile) {
 		{Name: "analytics.events"},
 		{Name: "payments.work"},
 	}
+	// Default pool sizes mirror the driver's defaultWorkerCounts() so the
+	// pre-poll snapshot matches reality until the management poll overwrites
+	// Workers with the real consumer count. PLAYTEST PASS 2: comfortable
+	// starting pressure — strain builds in the final minutes, not second one.
 	s.Pools = []PoolState{
-		{Queue: "orders.work", Workers: 3},
-		{Queue: "analytics.events", Workers: 2},
-		{Queue: "payments.work", Workers: 2},
+		{Queue: "orders.work", Workers: 6},
+		{Queue: "analytics.events", Workers: 6},
+		{Queue: "payments.work", Workers: 4},
 	}
 	s.Metrics = Metrics{
 		LatencyP50:   0,

@@ -24,12 +24,13 @@ const (
 	maxPublishRetry = 5
 )
 
-// cachedQueue is one queue's latest real telemetry plus the rolling rates the
-// poller derives by diffing cumulative counters between polls.
+// cachedQueue is one queue's latest real telemetry from the management API.
+// Depths are authoritative; NO rates are derived from mgmt counters here — the
+// message_stats counters reset on RabbitMQ's own retention schedule, so diffing
+// them against a fixed poll interval produced bogus rail rates. Rates come from
+// the runtime's own trackers instead (see applyRates).
 type cachedQueue struct {
-	stats   rabbitmq.QueueStats
-	rateIn  float64
-	rateOut float64
+	stats rabbitmq.QueueStats
 }
 
 // queueCache is written by the poller goroutine and read (non-blocking) by the
@@ -49,42 +50,10 @@ func newQueueCache() *queueCache {
 // evaluator; once a fail triggers or the ramp completes, the generator stops
 // and the final state is left in place (no os.Exit, so the HTTP/WS server and
 // broker connection stay alive for inspection).
-func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.Mgmt, rt *simulation.Runtime, hub *api.Hub, pm *rabbitmq.PoolManager, reg *rabbitmq.Registry) {
-	// Deterministic demo mode: BLACKOUT_SEED reproduces a run exactly. Default
-	// 42 gives the same incident every cold start (Chaos-Mode seeds build on
-	// this later).
-	var seed int64 = 42
-	if v := os.Getenv("BLACKOUT_SEED"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n != 0 {
-			seed = n
-		} else {
-			log.Printf("BLACKOUT_SEED %q ignored (want a non-zero integer)", v)
-		}
-	}
-
-	// Ramp defaults to 5 minutes; BLACKOUT_RAMP overrides only the ramp portion
-	// for faster dev loops. The survive window stays fixed at the real 8:00, so
-	// Hold = Survive − Ramp: a dev ramp of 120s still exercises the full
-	// 8-minute survive objective, just with a compressed build-up.
-	ramp := 5 * time.Minute
-	if v := os.Getenv("BLACKOUT_RAMP"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			ramp = d
-		} else {
-			log.Printf("BLACKOUT_RAMP %q ignored (want a positive duration)", v)
-		}
-	}
+func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.Mgmt, rt *simulation.Runtime, hub *api.Hub, pm *rabbitmq.PoolManager, reg *rabbitmq.Registry, runID int64) {
+	seed := seedFromEnv()
+	profile := stampedeProfileFromEnv()
 	survive := simulation.IncidentSurviveDuration
-	hold := survive - ramp
-	if hold < 0 {
-		hold = 0
-	}
-	profile := simulation.StampedeProfile{
-		BaseRate: 200,
-		PeakRate: 10000,
-		Ramp:     ramp,
-		Hold:     hold,
-	}
 	state := simulation.NewGame(seed, profile)
 	state.Sim = rt
 
@@ -101,6 +70,10 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 	var prevSnap *api.Snapshot
 	var lastLogSeq uint64
 
+	// One-shot health floor warnings so the console flags the crossing the tick
+	// it happens, instead of the player having to spot it in a 10-tick rail.
+	warn70, warn50 := false, false
+
 // Action log events are stamped with the CURRENT tick. They share the log delta
 // with that tick's traffic and arrive after it (same broadcast), so the client
 // dedup (append only events with tick > last-seen tick), which keys off the
@@ -112,8 +85,8 @@ hub.SetActionHandler(actionHandler)
 	t := time.NewTicker(simulation.TickInterval)
 	defer t.Stop()
 
-	log.Printf("simulation started (seed=%d, ramp=%s, hold=%s, survive=8:00, fastDB=%s)",
-		seed, ramp, hold, os.Getenv("BLACKOUT_FAST_DB"))
+	log.Printf("simulation started (run=%d, seed=%d, ramp=%s, hold=%s, survive=8:00, fastDB=%s)",
+		runID, seed, profile.Ramp, profile.Hold, os.Getenv("BLACKOUT_FAST_DB"))
 
 	for {
 		select {
@@ -131,7 +104,26 @@ hub.SetActionHandler(actionHandler)
 			applyCache(cache, state)
 			adapter.syncWired(state)
 			state.Log.Trim(maxEvents)
+
+			// One-shot health floor warnings, fired the tick they cross.
+			if generatorOn {
+				if !warn70 && state.Metrics.SystemHealth < 70 {
+					warn70 = true
+					log.Printf("WARN: system health dropped below 70%% at t=%s (health=%.0f%%)",
+						state.Elapsed.Round(simulation.TickInterval), state.Metrics.SystemHealth)
+				}
+				if !warn50 && state.Metrics.SystemHealth < 50 {
+					warn50 = true
+					log.Printf("WARN: system health dropped below 50%% at t=%s (health=%.0f%%)",
+						state.Elapsed.Round(simulation.TickInterval), state.Metrics.SystemHealth)
+				}
+			}
+
+			// Rail rates come from the runtime's own windowed trackers (exact
+			// windowing), not from diffing mgmt counters that reset on RabbitMQ's
+			// retention schedule.
 			if generatorOn && state.Tick%10 == 0 {
+				applyRates(state, rt)
 				logRail(state)
 			}
 
@@ -151,8 +143,16 @@ hub.SetActionHandler(actionHandler)
 			}
 
 			// Broadcast every tick (10Hz). Events are the whole log delta since
-			// the last broadcast; the client appends and dedups by tick.
+			// the last broadcast; the client appends and dedups by tick. Every
+			// message is tagged with the run it belongs to so the client can
+			// wipe its merged state the instant a retry starts (a fresh run
+			// also means prevSnap starts nil here → a full first frame).
 			snap := api.SnapshotFromState(state, !generatorOn)
+			snap.RunID = runID
+			snap.RunStatus = "running"
+			if out != nil {
+				snap.RunStatus = "ended"
+			}
 			snap.Events = state.Log.After(lastLogSeq)
 			lastLogSeq = state.Log.Seq()
 			delta := api.Delta(prevSnap, &snap)
@@ -168,6 +168,59 @@ hub.SetActionHandler(actionHandler)
 				logOutcome(state, out)
 				return
 			}
+		}
+	}
+}
+
+// seedFromEnv resolves the deterministic demo seed (BLACKOUT_SEED). Default 42
+// gives the same incident every cold start; 0 is rejected so Chaos-Mode seeds
+// (fed in later) can rely on non-zero RNG sources.
+func seedFromEnv() int64 {
+	var seed int64 = 42
+	if v := os.Getenv("BLACKOUT_SEED"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n != 0 {
+			seed = n
+		} else {
+			log.Printf("BLACKOUT_SEED %q ignored (want a non-zero integer)", v)
+		}
+	}
+	return seed
+}
+
+// stampedeProfileFromEnv builds Incident 1's traffic shape from env. Ramp
+// defaults to 5 minutes; BLACKOUT_RAMP overrides only the ramp portion for
+// faster dev loops. The survive window stays fixed at the real 8:00, so
+// Hold = Survive − Ramp: a dev ramp of 120s still exercises the full 8-minute
+// survive objective, just with a compressed build-up.
+func stampedeProfileFromEnv() simulation.StampedeProfile {
+	ramp := 5 * time.Minute
+	if v := os.Getenv("BLACKOUT_RAMP"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			ramp = d
+		} else {
+			log.Printf("BLACKOUT_RAMP %q ignored (want a positive duration)", v)
+		}
+	}
+	hold := simulation.IncidentSurviveDuration - ramp
+	if hold < 0 {
+		hold = 0
+	}
+	return simulation.StampedeProfile{
+		BaseRate: 200,
+		PeakRate: 10000,
+		Ramp:     ramp,
+		Hold:     hold,
+	}
+}
+
+// applyRates writes each queue's windowed in/out rate from the runtime's own
+// published-vs-acked+failed trackers (exact 1s window, no mgmt retention skew).
+func applyRates(s *simulation.GameState, rt *simulation.Runtime) {
+	rates := rt.SnapshotRates(simulation.TickInterval * 10)
+	for i := range s.Queues {
+		if r, ok := rates[s.Queues[i].Name]; ok {
+			s.Queues[i].RateIn = r.In
+			s.Queues[i].RateOut = r.Out
 		}
 	}
 }
@@ -258,8 +311,6 @@ func applyCache(c *queueCache, s *simulation.GameState) {
 		s.Queues[i].Depth = cq.stats.Messages
 		s.Queues[i].InFlight = cq.stats.MessagesReady
 		s.Queues[i].Unacked = cq.stats.MessagesUnacked
-		s.Queues[i].RateIn = cq.rateIn
-		s.Queues[i].RateOut = cq.rateOut
 		s.Sim.Reconcile(s.Queues[i].Name, cq.stats.Messages)
 	}
 	for i := range s.Pools {
@@ -270,8 +321,9 @@ func applyCache(c *queueCache, s *simulation.GameState) {
 }
 
 // pollQueues is a separate goroutine that samples the management API on a slow
-// cadence and writes into the cache. The first successful poll for a queue seeds
-// the rate baseline (rates = 0); later polls diff the cumulative counters.
+// cadence and writes into the cache. Depth/consumers are authoritative; rates
+// stay out (see applyRates) because mgmt counters reset on RabbitMQ's own
+// retention schedule.
 func pollQueues(ctx context.Context, mgmt *rabbitmq.Mgmt, cache *queueCache, names []string) {
 	t := time.NewTicker(mgmtPollEvery)
 	defer t.Stop()
@@ -283,7 +335,7 @@ func pollQueues(ctx context.Context, mgmt *rabbitmq.Mgmt, cache *queueCache, nam
 				log.Printf("bridge: management poll %q failed (%v); holding last-known", name, err)
 				continue
 			}
-			cache.update(name, stats, mgmtPollEvery)
+			cache.update(name, stats)
 		}
 	}
 	pollOnce()
@@ -297,27 +349,10 @@ func pollQueues(ctx context.Context, mgmt *rabbitmq.Mgmt, cache *queueCache, nam
 	}
 }
 
-func (c *queueCache) update(name string, stats rabbitmq.QueueStats, interval time.Duration) {
+func (c *queueCache) update(name string, stats rabbitmq.QueueStats) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	rateIn, rateOut := 0.0, 0.0
-	prev, ok := c.data[name]
-	if ok {
-		secs := interval.Seconds()
-		if secs > 0 {
-			if stats.PublishCount >= prev.stats.PublishCount {
-				rateIn = float64(stats.PublishCount-prev.stats.PublishCount) / secs
-			}
-			if stats.AckCount >= prev.stats.AckCount {
-				rateOut = float64(stats.AckCount-prev.stats.AckCount) / secs
-			}
-		}
-	}
-	c.data[name] = cachedQueue{
-		stats:   stats,
-		rateIn:  rateIn,
-		rateOut: rateOut,
-	}
+	c.data[name] = cachedQueue{stats: stats}
 }
 
 func snapshotQueueNames(s *simulation.GameState) []string {
@@ -369,6 +404,11 @@ func windowTotal(v []int64) int64 {
 // entries. The generator has already stopped at this point; the frozen final
 // state remains live in the server for inspection.
 func logOutcome(s *simulation.GameState, out *simulation.Outcome) {
+	if out.Failed {
+		log.Printf("=== RUN ENDED: FAILURE — %s ===", out.FailReason)
+	} else {
+		log.Printf("=== RUN ENDED: SURVIVED — the 8:00 surge was ridden out ===")
+	}
 	if out.Failed {
 		log.Printf("=== SCENARIO FAILED === reason: %s", out.FailReason)
 	} else {

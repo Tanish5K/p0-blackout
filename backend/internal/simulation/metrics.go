@@ -43,9 +43,13 @@ func deriveMetrics(s *GameState) {
 				// In sync mode the gateway blocks on the order queue, so its
 				// load must also track real backend pressure — otherwise the
 				// "gateway slow" story hides entirely behind non-gateway load.
+				// The threshold is 1s, not 0.5s: with transient messages the
+				// calm-state publish→ack p99 stays in the tens of ms, so this
+				// term only pinches once queues are genuinely backed up
+				// (depth → thousands), never from normal broker round-trips.
 				if ordersSync(s) && s.Sim != nil && s.Sim.Gateway != nil {
 					gp99 := s.Sim.Gateway.Percentile(99)
-					sv.Load = math.Max(sv.Load, clamp01(gp99.Seconds()/0.5))
+					sv.Load = math.Max(sv.Load, clamp01(gp99.Seconds()/1.0))
 				}
 			default:
 				sv.Load = clamp01(loads[sv.ID])
@@ -63,15 +67,19 @@ func deriveMetrics(s *GameState) {
 		}
 	}
 
-	// --- 2. Health drift: sustained overload degrades, recovery heals. ----
+	// --- 2. Health drift: sustained overload degrades, recovery heals. -----
+	// Drain is 0.5/tick (5/s) past a real pin (>0.95) and recovery 0.25/tick
+	// (2.5/s) below 0.7. A true overload window lasts minutes, so this gives
+	// the player ~10s of reaction time once a service pins instead of the old
+	// 1/tick (10/s) which walked 100→50 in five seconds.
 	for i := range s.Services {
 		sv := &s.Services[i]
-		if sv.Load > 0.9 {
+		if sv.Load > 0.95 {
 			if sv.Health > 0 {
-				sv.Health -= 1
+				sv.Health -= 0.5
 			}
 		} else if sv.Health < 100 && sv.Load < 0.7 {
-			sv.Health += 0.5
+			sv.Health += 0.25
 			if sv.Health > 100 {
 				sv.Health = 100
 			}
