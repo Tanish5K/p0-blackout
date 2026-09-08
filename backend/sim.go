@@ -102,6 +102,7 @@ hub.SetActionHandler(actionHandler)
 				bridgePublish(ctx, pub, state)
 			}
 			applyCache(cache, state)
+			syncPoolCounts(state, pm)
 			adapter.syncWired(state)
 			state.Log.Trim(maxEvents)
 
@@ -295,11 +296,12 @@ func appendDropped(s *simulation.GameState, subject string, n int64, err error) 
 	log.Printf("bridge: dropped %d messages on %s (%v)", n, subject, err)
 }
 
-// applyCache writes the latest polled telemetry into the state's queues and
-// pools, reading the poller's cache without blocking. Missing entries leave the
+// applyCache writes the latest polled telemetry into the state's queues,
+// reading the poller's cache without blocking. Missing entries leave the
 // last-known values untouched (no zeroing). It also reconciles the load
 // trackers against the authoritative real depth (client-prediction /
-// server-snapshot pattern).
+// server-snapshot pattern). Pool worker counts are NOT touched here — see
+// syncPoolCounts.
 func applyCache(c *queueCache, s *simulation.GameState) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -313,10 +315,17 @@ func applyCache(c *queueCache, s *simulation.GameState) {
 		s.Queues[i].Unacked = cq.stats.MessagesUnacked
 		s.Sim.Reconcile(s.Queues[i].Name, cq.stats.Messages)
 	}
+}
+
+// syncPoolCounts refreshes each pool's displayed worker count from the pool
+// manager's configured counts (what scale_workers / run start set). The old
+// source — RabbitMQ's management API "consumers" field — counts basic.consume
+// subscriptions, and each WorkerPool opens exactly ONE consume then dispatches
+// to N goroutines, so it always read 1 no matter how many workers were added.
+// Intent is the truth here; broker telemetry only reports queue depth.
+func syncPoolCounts(s *simulation.GameState, pm *rabbitmq.PoolManager) {
 	for i := range s.Pools {
-		if cq, ok := c.data[s.Pools[i].Queue]; ok {
-			s.Pools[i].Workers = cq.stats.Consumers
-		}
+		s.Pools[i].Workers = pm.Workers(s.Pools[i].Queue)
 	}
 }
 

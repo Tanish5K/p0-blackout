@@ -108,9 +108,12 @@ type QueueState struct {
 	RateOut  float64 `json:"rateOut"` // rolling window, per second
 }
 
-// PoolState is a consumer pool attached to a queue. Workers (consumer count) is
-// fed from real RabbitMQ telemetry once the sim is bridged; the fake CapPerTick
-// drain was removed because real consumers own how fast queues empty.
+// PoolState is a consumer pool attached to a queue. Workers is the CONFIGURED
+// pool size (set by scale_workers / run start and sourced from the pool
+// manager), not RabbitMQ's mgmt "consumers" count — one WorkerPool consumes on
+// a single channel, so RabbitMQ always reports 1 regardless of how many
+// goroutines actually drain the queue. The fake CapPerTick drain was removed
+// because real consumers own how fast queues empty.
 type PoolState struct {
 	Queue   string `json:"queue"`
 	Workers int    `json:"workers"`
@@ -160,10 +163,10 @@ func (s *GameState) resetServices(profile TrafficProfile) {
 		{Name: "analytics.events"},
 		{Name: "payments.work"},
 	}
-	// Default pool sizes mirror the driver's defaultWorkerCounts() so the
-	// pre-poll snapshot matches reality until the management poll overwrites
-	// Workers with the real consumer count. PLAYTEST PASS 2: comfortable
-	// starting pressure — strain builds in the final minutes, not second one.
+	// Default pool sizes mirror the driver's defaultWorkerCounts() so the first
+	// frames match reality before syncPoolCounts stamps them with the pool
+	// manager's authoritative counts. PLAYTEST PASS 2: comfortable starting
+	// pressure — strain builds in the final minutes, not second one.
 	s.Pools = []PoolState{
 		{Queue: "orders.work", Workers: 6},
 		{Queue: "analytics.events", Workers: 6},

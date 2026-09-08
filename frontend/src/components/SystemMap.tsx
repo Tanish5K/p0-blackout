@@ -113,10 +113,17 @@ function edgeRate(from: string, snap: MergedSnapshot): number {
 
 /* ── Node parts ──────────────────────────────────────────────────── */
 
+// isPausedSvc reports a service whose pool was stopped mid-game (unwired) vs a
+// stub that was never live — stubs also read wired=false but report status 'idle'.
+function isPausedSvc(svc?: ServiceSnapshot): boolean {
+  return !!svc && !svc.wired && svc.status !== 'idle'
+}
+
 function NodeCircle({ cx, cy, svc }: { cx: number; cy: number; svc?: ServiceSnapshot }) {
   const status = svc?.status ?? 'idle'
-  const fill = statusColor(status)
-  const showPulse = status !== 'idle' && status !== 'failed'
+  const paused = isPausedSvc(svc)
+  const fill = paused ? 'var(--idle)' : statusColor(status)
+  const showPulse = !paused && status !== 'idle' && status !== 'failed'
 
   return (
     <>
@@ -159,7 +166,9 @@ function NodeRingActive({ cx, cy, svc }: { cx: number; cy: number; svc?: Service
   const circumference = 2 * Math.PI * LOAD_RING_R
   const dashLen = circumference * load
   const gap = circumference - dashLen
-  const fill = svc ? statusColor(svc.status) : 'var(--idle)'
+  // While paused the arc keeps growing (pressure building in the queue) but
+  // renders in the neutral idle colour — not a false "healthy green".
+  const fill = isPausedSvc(svc) ? 'var(--idle)' : svc ? statusColor(svc.status) : 'var(--idle)'
 
   return (
     <circle
@@ -179,6 +188,7 @@ function NodeLabel({ cx, cy, svc }: { cx: number; cy: number; svc?: ServiceSnaps
   const name = svc?.name ?? '—'
   const health = svc?.health ?? 0
   const status = svc?.status ?? 'idle'
+  const paused = isPausedSvc(svc)
 
   return (
     <>
@@ -190,7 +200,7 @@ function NodeLabel({ cx, cy, svc }: { cx: number; cy: number; svc?: ServiceSnaps
       >
         {name}
       </text>
-      {status !== 'idle' && (
+      {status !== 'idle' && !paused && (
         <text
           x={cx}
           y={cy + 14}
@@ -200,14 +210,14 @@ function NodeLabel({ cx, cy, svc }: { cx: number; cy: number; svc?: ServiceSnaps
           {Math.round(health)}%
         </text>
       )}
-      {status === 'idle' && (
+      {(status === 'idle' || paused) && (
         <text
           x={cx}
           y={cy + 14}
           textAnchor="middle"
           className="node-stat idle"
         >
-          idle
+          {paused ? 'paused' : 'idle'}
         </text>
       )}
     </>
