@@ -26,7 +26,15 @@ export function emptySnapshot(): MergedSnapshot {
     services: [],
     queues: [],
     pools: [],
-    metrics: { systemHealth: 0, successRate: 0, latencyMs: { p50: 0, p99: 0 } },
+    metrics: {
+      systemHealth: 0,
+      successRate: 0,
+      latencyMs: { p50: 0, p99: 0 },
+      latencyStale: false,
+      successStale: false,
+      latencyAgeMs: 0,
+      successAgeMs: 0,
+    },
     objectives: [],
     events: [],
   }
@@ -93,6 +101,8 @@ function mergeMetrics(
   if (!next || (!next.systemHealth && !next.successRate && !next.latencyMs.p50 && !next.latencyMs.p99)) {
     return prev
   }
+  // Stale flags/ages use `??` (not truthiness): a false/0 from the backend is
+  // a real "fresh now" signal and must not be swallowed by a latched true.
   return {
     systemHealth: next.systemHealth || prev.systemHealth,
     successRate: next.successRate || prev.successRate,
@@ -100,6 +110,10 @@ function mergeMetrics(
       p50: next.latencyMs.p50 || prev.latencyMs.p50,
       p99: next.latencyMs.p99 || prev.latencyMs.p99,
     },
+    latencyStale: next.latencyStale ?? prev.latencyStale,
+    successStale: next.successStale ?? prev.successStale,
+    latencyAgeMs: next.latencyAgeMs ?? prev.latencyAgeMs,
+    successAgeMs: next.successAgeMs ?? prev.successAgeMs,
   }
 }
 
@@ -160,6 +174,7 @@ function lerpServices(
       health: lerp(sa.health, sb.health, t),
       status: t >= 0.5 ? sb.status : sa.status,
       wired: t >= 0.5 ? sb.wired : sa.wired,
+      stalled: t >= 0.5 ? sb.stalled : sa.stalled,
       synchronous: t >= 0.5 ? sb.synchronous : sa.synchronous,
     })
   }
@@ -173,6 +188,7 @@ const STUB_SERVICE: ServiceSnapshot = {
   health: 100,
   status: 'idle',
   wired: false,
+  stalled: false,
   synchronous: false,
 }
 
@@ -235,6 +251,12 @@ function lerpMetrics(a: MetricsSnapshot, b: MetricsSnapshot, t: number): Metrics
       p50: lerp(a.latencyMs.p50, b.latencyMs.p50, t),
       p99: lerp(a.latencyMs.p99, b.latencyMs.p99, t),
     },
+    // Stale flags/ages are booleans and point-in-time stamps: snap to b rather
+    // than interpolating (a mid-transition stale flip would be meaningless).
+    latencyStale: b.latencyStale,
+    successStale: b.successStale,
+    latencyAgeMs: b.latencyAgeMs,
+    successAgeMs: b.successAgeMs,
   }
 }
 
@@ -271,6 +293,14 @@ export function formatPct(v: number): string {
 export function formatRate(v: number): string {
   if (v >= 1000) return `${(v / 1000).toFixed(1)}k`
   return `${Math.round(v)}`
+}
+
+/** Format a millisecond age as "12s ago" / "2m ago" (empty for "never"). */
+export function formatAgo(ms: number): string {
+  if (!ms || ms < 0) return ''
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s ago`
+  return `${Math.floor(s / 60)}m ${s % 60}s ago`
 }
 
 export function formatDepth(v: number): string {

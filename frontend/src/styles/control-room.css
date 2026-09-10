@@ -131,6 +131,22 @@ body {
 .rail-metric.warn     .metric-value { color: var(--warn); }
 .rail-metric.danger   .metric-value { color: var(--danger); }
 
+/* Stale metrics (no fresh samples — paused/everything-paused runs): grayed
+   with an age suffix so "—" reads as intent, not a broken number. */
+.metric-stale {
+  opacity: 0.45;
+}
+.rail-metric.metric-stale .metric-value {
+  color: var(--faint);
+}
+.metric-age {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--faint);
+  opacity: 0.8;
+  margin-left: 2px;
+}
+
 .pill {
   padding: 4px 12px;
   border-radius: 999px;

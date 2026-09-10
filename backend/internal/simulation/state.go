@@ -91,6 +91,13 @@ type ServiceState struct {
 	// frontend so pause/resume controls can show their current state.
 	Wired bool `json:"wired"`
 
+	// Stalled flags a service whose queue is receiving messages but has no
+	// consumers draining them (paused pool, backlog climbing). It is the
+	// "messages entering, nobody consuming" failure signature the rail's
+	// latency/success numbers cannot see — the map node uses it to show the
+	// pause as pressure, not as a healthy green.
+	Stalled bool `json:"stalled"`
+
 	// Synchronous marks the orders path's processing mode (Incident 1's
 	// sync/async toggle). Sync = the gateway blocks on the order queue's ack;
 	// async = fire-and-forget. Only the orders service toggles today; the flag
@@ -125,6 +132,21 @@ type Metrics struct {
 	LatencyP99   time.Duration `json:"-"`
 	SuccessRate  float64       `json:"successRate"`
 	SystemHealth float64       `json:"systemHealth"`
+
+	// LatencyStale/SuccessStale mark metrics with no fresh completions inside
+	// the sample window. A paused-everything run leaves the gateway latency
+	// sampler empty and freezes the cumulative success ratio; both would read
+	// as healthy ("8ms / 100%") next to a real failure. The flag lets the UI
+	// render "—" instead of a confidently-wrong number. The numerics stay
+	// cumulative/windowed as before — the stale flags only affect DISPLAY.
+	LatencyStale  bool `json:"-"`
+	SuccessStale  bool `json:"-"`
+
+	// LatencyAgeMs/SuccessAgeMs are how long ago the underlying completions
+	// last moved (0 = never in this run). The UI shows "last updated Xs ago"
+	// alongside a stale flag so a blanked number reads as intent, not a bug.
+	LatencyAgeMs  float64 `json:"-"`
+	SuccessAgeMs  float64 `json:"-"`
 }
 
 // NewGame builds a fresh, seeded GameState for a profile.

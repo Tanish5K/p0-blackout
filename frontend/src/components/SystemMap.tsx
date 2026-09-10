@@ -113,17 +113,20 @@ function edgeRate(from: string, snap: MergedSnapshot): number {
 
 /* ── Node parts ──────────────────────────────────────────────────── */
 
-// isPausedSvc reports a service whose pool was stopped mid-game (unwired) vs a
-// stub that was never live — stubs also read wired=false but report status 'idle'.
-function isPausedSvc(svc?: ServiceSnapshot): boolean {
-  return !!svc && !svc.wired && svc.status !== 'idle'
+// dormantSvc is the union of "paused" and "stalled": a node that is not doing
+// work right now. Stalled (paused AND its queue filling with nobody consuming)
+// supersedes paused for display — it is the urgent reading the rail's
+// latency/success can't see. Stubs read wired=false but status 'idle', so they
+// never count as dormant. Either way the node renders grey, pulse off.
+function dormantSvc(svc?: ServiceSnapshot): boolean {
+  return !!svc && (svc.stalled === true || (!svc.wired && svc.status !== 'idle'))
 }
 
 function NodeCircle({ cx, cy, svc }: { cx: number; cy: number; svc?: ServiceSnapshot }) {
   const status = svc?.status ?? 'idle'
-  const paused = isPausedSvc(svc)
-  const fill = paused ? 'var(--idle)' : statusColor(status)
-  const showPulse = !paused && status !== 'idle' && status !== 'failed'
+  const dormant = dormantSvc(svc)
+  const fill = dormant ? 'var(--idle)' : statusColor(status)
+  const showPulse = !dormant && status !== 'idle' && status !== 'failed'
 
   return (
     <>
@@ -166,9 +169,10 @@ function NodeRingActive({ cx, cy, svc }: { cx: number; cy: number; svc?: Service
   const circumference = 2 * Math.PI * LOAD_RING_R
   const dashLen = circumference * load
   const gap = circumference - dashLen
-  // While paused the arc keeps growing (pressure building in the queue) but
-  // renders in the neutral idle colour — not a false "healthy green".
-  const fill = isPausedSvc(svc) ? 'var(--idle)' : svc ? statusColor(svc.status) : 'var(--idle)'
+  // While dormant (paused or stalled) the arc keeps growing — pressure
+  // building in the queue — but renders in the neutral idle colour, not a
+  // false "healthy green".
+  const fill = dormantSvc(svc) ? 'var(--idle)' : svc ? statusColor(svc.status) : 'var(--idle)'
 
   return (
     <circle
@@ -188,7 +192,8 @@ function NodeLabel({ cx, cy, svc }: { cx: number; cy: number; svc?: ServiceSnaps
   const name = svc?.name ?? '—'
   const health = svc?.health ?? 0
   const status = svc?.status ?? 'idle'
-  const paused = isPausedSvc(svc)
+  const stalled = dormantSvc(svc) && svc?.stalled === true
+  const paused = dormantSvc(svc) && !stalled
 
   return (
     <>
@@ -200,7 +205,7 @@ function NodeLabel({ cx, cy, svc }: { cx: number; cy: number; svc?: ServiceSnaps
       >
         {name}
       </text>
-      {status !== 'idle' && !paused && (
+      {status !== 'idle' && !dormantSvc(svc) && (
         <text
           x={cx}
           y={cy + 14}
@@ -210,14 +215,14 @@ function NodeLabel({ cx, cy, svc }: { cx: number; cy: number; svc?: ServiceSnaps
           {Math.round(health)}%
         </text>
       )}
-      {(status === 'idle' || paused) && (
+      {(status === 'idle' || dormantSvc(svc)) && (
         <text
           x={cx}
           y={cy + 14}
           textAnchor="middle"
           className="node-stat idle"
         >
-          {paused ? 'paused' : 'idle'}
+          {stalled ? 'stalled' : paused ? 'paused' : 'idle'}
         </text>
       )}
     </>

@@ -31,6 +31,12 @@ type queueState struct {
 	// (published − acked − failed) is a self-contained windowed rate source
 	// that does NOT depend on RabbitMQ's management counter retention.
 	published atomic.Int64
+	// lastCompletion is the wall-clock ms of the most recent ack or failure for
+	// this queue. Zero means nothing has completed since the run started. It
+	// feeds the stale-metric flags: a queue with no completion inside the
+	// sample window has nothing current to report latency/success from, and for
+	// a paused pool that window goes empty every single tick.
+	lastCompletion atomic.Int64
 	// prevPub/prevAck are the previous sample's counters for SnapshotRates' deltas.
 	prevPub int64
 	prevAck int64
@@ -190,6 +196,7 @@ func (rt *Runtime) AddAcked(queue string, n int) {
 	if ok {
 		t.tracker.AddAcked(int64(n))
 		t.acked.Add(int64(n))
+		t.lastCompletion.Store(time.Now().UnixMilli())
 	}
 }
 
@@ -200,6 +207,7 @@ func (rt *Runtime) AddFailed(queue string, n int) {
 	rt.mu.RUnlock()
 	if ok {
 		t.failed.Add(int64(n))
+		t.lastCompletion.Store(time.Now().UnixMilli())
 	}
 }
 
@@ -248,6 +256,41 @@ func (rt *Runtime) SuccessRate(queue string) float64 {
 		return 1
 	}
 	return float64(t.acked.Load()) / float64(total)
+}
+
+// LastCompletion returns the wall-clock time of the most recent ack or failure
+// for a queue, or the zero Time if nothing has completed this run.
+func (rt *Runtime) LastCompletion(queue string) time.Time {
+	rt.mu.RLock()
+	t, ok := rt.queues[queue]
+	rt.mu.RUnlock()
+	if !ok {
+		return time.Time{}
+	}
+	ms := t.lastCompletion.Load()
+	if ms == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(ms)
+}
+
+// NewestCompletion returns the most recent completion time across all queues,
+// or the zero Time if nothing has completed this run. It is the freshness
+// source for the aggregate customer-success metric.
+func (rt *Runtime) NewestCompletion() time.Time {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	var newest time.Time
+	for _, q := range rt.queues {
+		ms := q.lastCompletion.Load()
+		if ms == 0 {
+			continue
+		}
+		if t := time.UnixMilli(ms); t.After(newest) {
+			newest = t
+		}
+	}
+	return newest
 }
 
 // QueueSnapshot is a read-only view used by the metrics pass.

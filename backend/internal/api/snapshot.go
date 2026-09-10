@@ -44,6 +44,9 @@ type ServiceSnapshot struct {
 	// Wired mirrors the registry's live-MQ flag: paused services read false so
 	// the frontend can show pause/resume control state.
 	Wired bool `json:"wired"`
+	// Stalled flags a paused service whose queue is filling with nobody
+	// consuming — the failure signature the rail's latency/success can't see.
+	Stalled bool `json:"stalled"`
 	// Synchronous reflects the orders path's processing mode; only wired
 	// services toggle it, stubs always report false.
 	Synchronous bool `json:"synchronous"`
@@ -66,7 +69,14 @@ type OutcomeSnapshot struct {
 	Success   float64  `json:"success"`
 	P50Ms     float64  `json:"p50Ms"`
 	P99Ms     float64  `json:"p99Ms"`
-	Timeline  []string `json:"timeline"`
+	// LatencyStale/SuccessStale flag terminal metrics computed with no fresh
+	// completions in the sample window (e.g. pause-everything): the postmortem
+	// renders those as grayed "—" instead of reporting 8ms / 100% as current.
+	LatencyStale bool    `json:"latencyStale"`
+	SuccessStale bool    `json:"successStale"`
+	LatencyAgeMs float64 `json:"latencyAgeMs"`
+	SuccessAgeMs float64 `json:"successAgeMs"`
+	Timeline     []string `json:"timeline"`
 }
 
 type QueueSnapshot struct {
@@ -87,6 +97,13 @@ type MetricsSnapshot struct {
 	SystemHealth float64   `json:"systemHealth"`
 	SuccessRate  float64   `json:"successRate"`
 	LatencyMs    LatencyMs `json:"latencyMs"`
+	// Stale flags + ages tell the frontend which rail numbers to gray out as
+	// "no fresh samples" instead of showing frozen/fabricated readings. See
+	// simulation.Metrics.
+	LatencyStale  bool    `json:"latencyStale"`
+	SuccessStale  bool    `json:"successStale"`
+	LatencyAgeMs  float64 `json:"latencyAgeMs"`
+	SuccessAgeMs  float64 `json:"successAgeMs"`
 }
 
 type LatencyMs struct {
@@ -128,6 +145,7 @@ func SnapshotFromState(s *simulation.GameState, ended bool) Snapshot {
 			Health:      sv.Health,
 			Status:      string(sv.Status),
 			Wired:       sv.Wired,
+			Stalled:     sv.Stalled,
 			Synchronous: sv.Synchronous,
 		}
 	}
@@ -175,20 +193,28 @@ func SnapshotFromState(s *simulation.GameState, ended bool) Snapshot {
 	if s.Outcome != nil {
 		m := s.Outcome.FinalMetrics
 		snap.Outcome = &OutcomeSnapshot{
-			Failed:    s.Outcome.Failed,
-			Reason:    s.Outcome.FailReason,
-			EndedAtMs: s.Outcome.EndedAt.Milliseconds(),
-			Health:    m.SystemHealth,
-			Success:   m.SuccessRate,
-			P50Ms:     float64(m.LatencyP50.Microseconds()) / 1000.0,
-			P99Ms:     float64(m.LatencyP99.Microseconds()) / 1000.0,
-			Timeline:  s.Timeline,
+			Failed:       s.Outcome.Failed,
+			Reason:       s.Outcome.FailReason,
+			EndedAtMs:    s.Outcome.EndedAt.Milliseconds(),
+			Health:       m.SystemHealth,
+			Success:      m.SuccessRate,
+			P50Ms:        float64(m.LatencyP50.Microseconds()) / 1000.0,
+			P99Ms:        float64(m.LatencyP99.Microseconds()) / 1000.0,
+			LatencyStale: m.LatencyStale,
+			SuccessStale: m.SuccessStale,
+			LatencyAgeMs: m.LatencyAgeMs,
+			SuccessAgeMs: m.SuccessAgeMs,
+			Timeline:     s.Timeline,
 		}
 	}
 
 	snap.Metrics = MetricsSnapshot{
-		SystemHealth: s.Metrics.SystemHealth,
-		SuccessRate:  s.Metrics.SuccessRate,
+		SystemHealth:  s.Metrics.SystemHealth,
+		SuccessRate:   s.Metrics.SuccessRate,
+		LatencyStale:  s.Metrics.LatencyStale,
+		SuccessStale:  s.Metrics.SuccessStale,
+		LatencyAgeMs:  s.Metrics.LatencyAgeMs,
+		SuccessAgeMs:  s.Metrics.SuccessAgeMs,
 		LatencyMs: LatencyMs{
 			P50: float64(s.Metrics.LatencyP50.Microseconds()) / 1000.0,
 			P99: float64(s.Metrics.LatencyP99.Microseconds()) / 1000.0,
@@ -226,7 +252,11 @@ func Delta(prev, cur *Snapshot) *Snapshot {
 	if prev.Metrics.SystemHealth == cur.Metrics.SystemHealth &&
 		prev.Metrics.SuccessRate == cur.Metrics.SuccessRate &&
 		prev.Metrics.LatencyMs.P50 == cur.Metrics.LatencyMs.P50 &&
-		prev.Metrics.LatencyMs.P99 == cur.Metrics.LatencyMs.P99 {
+		prev.Metrics.LatencyMs.P99 == cur.Metrics.LatencyMs.P99 &&
+		prev.Metrics.LatencyStale == cur.Metrics.LatencyStale &&
+		prev.Metrics.SuccessStale == cur.Metrics.SuccessStale &&
+		prev.Metrics.LatencyAgeMs == cur.Metrics.LatencyAgeMs &&
+		prev.Metrics.SuccessAgeMs == cur.Metrics.SuccessAgeMs {
 		out.Metrics = MetricsSnapshot{}
 	}
 
@@ -240,6 +270,7 @@ func servicesEqual(a, b []ServiceSnapshot) bool {
 	for i := range a {
 		if a[i].Load != b[i].Load || a[i].Health != b[i].Health ||
 			a[i].Status != b[i].Status || a[i].Wired != b[i].Wired ||
+			a[i].Stalled != b[i].Stalled ||
 			a[i].Synchronous != b[i].Synchronous {
 			return false
 		}

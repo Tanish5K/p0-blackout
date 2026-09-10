@@ -1,5 +1,5 @@
 import type { OutcomeSnapshot } from '../types/game'
-import { formatPct } from '../lib/snapshot'
+import { formatAgo, formatPct } from '../lib/snapshot'
 
 interface PostmortemProps {
   outcome: OutcomeSnapshot
@@ -8,7 +8,18 @@ interface PostmortemProps {
   onRetry: () => void
 }
 
+// Stale terminal metrics (no completions in the sample window) render as a
+// grayed "—" with an age suffix: the number stopped being true a while back,
+// and showing it as current is exactly the misleading reading this fixes.
+function metricOutcome(value: string, stale: boolean, ageMs: number): { value: string; stale: boolean; ago: string } {
+  const ago = stale ? formatAgo(ageMs) : ''
+  return { value: stale ? '—' : value, stale, ago }
+}
+
 export function Postmortem({ outcome, clock, onClose, onRetry }: PostmortemProps) {
+  const success = metricOutcome(formatPct(outcome.success * 100), outcome.successStale, outcome.successAgeMs)
+  const p99 = metricOutcome(`${outcome.p99Ms.toFixed(0)}ms`, outcome.latencyStale, outcome.latencyAgeMs)
+
   return (
     <div className="postmortem-overlay" role="dialog" aria-modal="true">
       <div className={`postmortem-card ${outcome.failed ? 'failed' : 'survived'}`}>
@@ -28,11 +39,17 @@ export function Postmortem({ outcome, clock, onClose, onRetry }: PostmortemProps
           </div>
           <div className="pm-metric">
             <span className="pm-label">Customer Success</span>
-            <span className="pm-value">{formatPct(outcome.success * 100)}</span>
+            <span className={`pm-value ${success.stale ? 'metric-stale' : ''}`}>
+              {success.value}
+              {success.ago && <em className="metric-age"> · {success.ago}</em>}
+            </span>
           </div>
           <div className="pm-metric">
             <span className="pm-label">P99 latency</span>
-            <span className="pm-value">{outcome.p99Ms.toFixed(0)}ms</span>
+            <span className={`pm-value ${p99.stale ? 'metric-stale' : ''}`}>
+              {p99.value}
+              {p99.ago && <em className="metric-age"> · {p99.ago}</em>}
+            </span>
           </div>
           <div className="pm-metric">
             <span className="pm-label">Incident clock</span>

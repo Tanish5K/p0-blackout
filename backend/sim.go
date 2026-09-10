@@ -106,17 +106,19 @@ hub.SetActionHandler(actionHandler)
 			adapter.syncWired(state)
 			state.Log.Trim(maxEvents)
 
-			// One-shot health floor warnings, fired the tick they cross.
+			// One-shot health floor warnings, fired the tick they cross. The
+			// worst service is named — a bare percentage hides which node the
+			// rail is silently reporting on.
 			if generatorOn {
 				if !warn70 && state.Metrics.SystemHealth < 70 {
 					warn70 = true
-					log.Printf("WARN: system health dropped below 70%% at t=%s (health=%.0f%%)",
-						state.Elapsed.Round(simulation.TickInterval), state.Metrics.SystemHealth)
+					log.Printf("WARN: system health dropped below 70%% at t=%s (health=%.0f%%, worst=%s)",
+						state.Elapsed.Round(simulation.TickInterval), state.Metrics.SystemHealth, worstServiceAt(state))
 				}
 				if !warn50 && state.Metrics.SystemHealth < 50 {
 					warn50 = true
-					log.Printf("WARN: system health dropped below 50%% at t=%s (health=%.0f%%)",
-						state.Elapsed.Round(simulation.TickInterval), state.Metrics.SystemHealth)
+					log.Printf("WARN: system health dropped below 50%% at t=%s (health=%.0f%%, worst=%s)",
+						state.Elapsed.Round(simulation.TickInterval), state.Metrics.SystemHealth, worstServiceAt(state))
 				}
 			}
 
@@ -515,6 +517,8 @@ func buildTimeline(s *simulation.GameState, out *simulation.Outcome) []string {
 	var peakAt string
 	health70, health50 := false, false
 	var t70, t50 string
+	var worst70, worst50 string
+	var lastStates []simulation.ServiceStateReport
 
 	for _, e := range s.Log.After(0) {
 		switch e.Type {
@@ -525,15 +529,22 @@ func buildTimeline(s *simulation.GameState, out *simulation.Outcome) []string {
 			}
 		case "action":
 			beats = append(beats, fmt.Sprintf("%s at %s", playerActionBeats(e.Subject, e.Data), stamp(e.Time)))
+		case "state":
+			// The latest per-service snapshot rides the same rail cadence as
+			// the metric events, so a crossing below can quote which service
+			// was actually worst at that moment.
+			lastStates, _ = simulation.ParseServiceState(e.Data)
 		case "metric":
 			if h, ok := healthIn(e.Data); ok {
 				if !health70 && h < 70 {
 					health70 = true
 					t70 = stamp(e.Time)
+					worst70 = worstDetail(lastStates)
 				}
 				if !health50 && h < 50 {
 					health50 = true
 					t50 = stamp(e.Time)
+					worst50 = worstDetail(lastStates)
 				}
 			}
 		}
@@ -545,10 +556,10 @@ func buildTimeline(s *simulation.GameState, out *simulation.Outcome) []string {
 		beats = append(beats, fmt.Sprintf("Traffic reached ~%.0f req/s (%s)", peak, peakAt))
 	}
 	if health70 {
-		beats = append(beats, "System Health first dropped below 70% ("+t70+")")
+		beats = append(beats, "System Health first dropped below 70% ("+t70+")"+worst70)
 	}
 	if health50 {
-		beats = append(beats, "System Health first dropped below 50% ("+t50+")")
+		beats = append(beats, "System Health first dropped below 50% ("+t50+")"+worst50)
 	}
 
 	if out.Failed {
@@ -593,6 +604,80 @@ func playerActionBeats(action, data string) string {
 	default:
 		return "Operator ran " + action
 	}
+}
+
+// worstDetail describes the worst service in a state snapshot the way a
+// postmortem beat should: a paused service is called out as pressure
+// ("paused, depth 4,200, nothing consuming") rather than staying invisible
+// behind a bare percentage; a draining service gets its load/depth readout.
+func worstDetail(states []simulation.ServiceStateReport) string {
+	if len(states) == 0 {
+		return ""
+	}
+	worst := &states[0]
+	for i := range states {
+		if states[i].Health < worst.Health {
+			worst = &states[i]
+		}
+	}
+	name := displayName(worst.ID)
+	if !worst.Wired && worst.RateOut == 0 {
+		if worst.RateIn > 0 {
+			return fmt.Sprintf(" — %s: paused, depth %s, nothing consuming", name, fmtDepth(worst.Depth))
+		}
+		return fmt.Sprintf(" — %s: paused, queue idle", name)
+	}
+	return fmt.Sprintf(" — %s: load %.2f, depth %s", name, worst.Load, fmtDepth(worst.Depth))
+}
+
+// worstServiceAt names the lowest-health service from the live state, for the
+// one-shot console floor warnings.
+func worstServiceAt(s *simulation.GameState) string {
+	if len(s.Services) == 0 {
+		return "?"
+	}
+	worst := &s.Services[0]
+	for i := range s.Services {
+		if s.Services[i].Health < worst.Health {
+			worst = &s.Services[i]
+		}
+	}
+	name := displayName(worst.ID)
+	if !worst.Wired {
+		var depth int64
+		for i := range s.Queues {
+			if strings.HasPrefix(s.Queues[i].Name, worst.ID) {
+				depth = s.Queues[i].Depth
+				break
+			}
+		}
+		return fmt.Sprintf("%s: paused, depth %s, not consuming", name, fmtDepth(depth))
+	}
+	return fmt.Sprintf("%s: load %.2f", name, worst.Load)
+}
+
+func displayName(id string) string {
+	if n, ok := serviceDisplayNames[id]; ok {
+		return n
+	}
+	return id
+}
+
+var serviceDisplayNames = map[string]string{
+	"gateway":   "Gateway",
+	"orders":    "Orders",
+	"payments":  "Payments",
+	"analytics": "Analytics",
+}
+
+func fmtDepth(d int64) string {
+	if d >= 10000 {
+		return fmt.Sprintf("%.0fk", float64(d)/1000)
+	}
+	if d >= 1000 {
+		return fmt.Sprintf("%.1fk", float64(d)/1000)
+	}
+	return fmt.Sprintf("%d", d)
 }
 
 // stamp formats an elapsed duration as mm:ss for timeline beats.

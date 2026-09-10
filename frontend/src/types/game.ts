@@ -49,6 +49,10 @@ export interface ServiceSnapshot {
   // Wired=false means the service is paused (or, for stubs, never live): its
   // controls switch to resume and its mode toggle is disabled.
   wired?: boolean
+  // Stalled flags a paused service whose queue is filling with nobody
+  // consuming — the failure signature the rail's latency/success can't see.
+  // The map node renders it grey with a "stalled" tag instead of green.
+  stalled?: boolean
   // Synchronous reflects the orders path's processing mode (Incident 1's
   // sync/async toggle).
   synchronous?: boolean
@@ -77,6 +81,13 @@ export interface MetricsSnapshot {
   systemHealth: number
   successRate: number
   latencyMs: LatencyMs
+  // Stale flags + ages mark rail numbers with no fresh samples (e.g. a paused
+  // queue): the UI grays them out with an age suffix instead of reporting a
+  // frozen/fabricated reading as current. Numerics stay unchanged behind them.
+  latencyStale: boolean
+  successStale: boolean
+  latencyAgeMs: number
+  successAgeMs: number
 }
 
 /* ── Objectives + terminal outcome (Phase 5) ─────────────────────── */
@@ -98,6 +109,12 @@ export interface OutcomeSnapshot {
   success: number
   p50Ms: number
   p99Ms: number
+  // Terminal-stale flags (same semantics as MetricsSnapshot): success/p99 get
+  // grayed with an age suffix instead of reading as a live 100% / 8ms.
+  latencyStale: boolean
+  successStale: boolean
+  latencyAgeMs: number
+  successAgeMs: number
   timeline: string[]
 }
 
