@@ -66,6 +66,10 @@ type Outcome struct {
 	FinalMetrics Metrics
 	FinalTicks   int64
 	Survive      []SurviveResult
+	// PeakWorkers is the highest sum of configured pool workers reached during
+	// the run — the campaign-cascade input (aggressive Incident 1 scaling is
+	// paid for in Incident 2). Set by the driver before the outcome is settled.
+	PeakWorkers int
 }
 
 // Objectives evaluates a set of objectives tick by tick and settles on a
@@ -83,12 +87,39 @@ type Objectives struct {
 // System Health > 50 and Customer Success > 70 are fail floors; the incident is
 // survived by riding the full 8:00 window ("Survive 8:00").
 func NewObjectives() *Objectives {
+	return NewObjectivesWith(baseObjectiveItems())
+}
+
+// NewObjectivesWith builds an evaluator from an explicit objective set. It is
+// the incident-as-data seam: scenario authors assemble their own item list
+// (aggregate floors + per-critical-service stability floors + the survive
+// clock) and hand it straight to the evaluator.
+func NewObjectivesWith(items []Objective) *Objectives {
 	o := &Objectives{
 		failIdx:   make(map[string]int),
 		streaks:   make(map[string]int),
 		maxStreak: make(map[string]int),
 	}
-	o.items = []Objective{
+	o.items = append(o.items, items...)
+	for i, it := range o.items {
+		if it.Role == RoleFail {
+			o.failIdx[it.ID] = i
+		}
+	}
+	return o
+}
+
+// BaseObjectiveItems exposes the canonical aggregate floors + survive set for
+// scenario authors outside the package (incident specs compose their own lists
+// with it, e.g. Incident 2 layers per-service floors on top).
+func BaseObjectiveItems() []Objective {
+	return baseObjectiveItems()
+}
+
+// baseObjectiveItems is Incident 1's canonical objective set, reused by every
+// incident (incident 2 layers per-critical-service floors on top).
+func baseObjectiveItems() []Objective {
+	return []Objective{
 		{
 			ID:            "system-health-floor",
 			Label:         "System Health",
@@ -128,12 +159,37 @@ func NewObjectives() *Objectives {
 			},
 		},
 	}
-	for i, it := range o.items {
-		if it.Role == RoleFail {
-			o.failIdx[it.ID] = i
-		}
+}
+
+// CriticalServiceFloor is a per-critical-service uptime objective, structurally
+// separate from the aggregate System Health floor: a single degraded critical
+// node trips ITS OWN fail floor even when aggregate health stays above its
+// line (e.g. Identity-only degradation in Incident 2).
+func CriticalServiceFloor(id, label string) Objective {
+	return Objective{
+		ID:            id + "-health-floor",
+		Label:         label,
+		Desc:          label + " Health must stay above 50%",
+		Role:          RoleFail,
+		DebounceTicks: 3,
+		Metric: func(s *GameState) float64 {
+			for i := range s.Services {
+				if s.Services[i].ID == id {
+					return s.Services[i].Health
+				}
+			}
+			return 100
+		},
+		Target: 50,
+		Check: func(s *GameState) bool {
+			for i := range s.Services {
+				if s.Services[i].ID == id {
+					return s.Services[i].Health <= 50
+				}
+			}
+			return false
+		},
 	}
-	return o
 }
 
 // Status returns the live objective strip for the current snapshot.

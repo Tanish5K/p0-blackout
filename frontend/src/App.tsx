@@ -6,7 +6,7 @@ import { SystemMap } from './components/SystemMap'
 import { Inspector } from './components/Inspector'
 import { EventTape } from './components/EventTape'
 import { Postmortem } from './components/Postmortem'
-import { StartScreen } from './components/StartScreen'
+import { HomeScreen } from './components/HomeScreen'
 
 export default function App() {
   const conn = useGameState()
@@ -52,13 +52,20 @@ export default function App() {
       <EventTape events={conn.snapshot.events} />
 
       {runStatus === 'idle' && (
-        <StartScreen status={conn.status} runStatus={runStatus} onStart={() => runControl('start')} />
+        <HomeScreen
+          status={conn.status}
+          runStatus={runStatus}
+          snapshot={conn.snapshot}
+          onStart={() => runControl('start')}
+        />
       )}
 
       {runStatus === 'ended' && conn.snapshot.outcome && (
         <Postmortem
           outcome={conn.snapshot.outcome}
           clock={conn.snapshot.clock}
+          incidentNumber={conn.snapshot.incidentNumber}
+          campaignTotal={conn.snapshot.campaignTotal}
           onClose={() => undefined}
           onRetry={() => runControl('retry')}
         />

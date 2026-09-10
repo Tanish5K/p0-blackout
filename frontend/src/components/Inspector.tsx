@@ -1,4 +1,4 @@
-import type { MergedSnapshot, RunAction } from '../types/game'
+import type { MergedSnapshot, PoolSnapshot, RunAction } from '../types/game'
 import {
   serviceQueueID,
   findQueue,
@@ -137,6 +137,23 @@ export function Inspector({ snapshot, selectedId, onClose, onAction }: Inspector
             </div>
           )}
 
+          {pool && pool.ackPolicy && (
+            <AckPolicyRow pool={pool} onAction={onAction} />
+          )}
+
+          {pool && pool.live !== undefined && (
+            <WorkerSlots pool={pool} service={selectedId} onAction={onAction} />
+          )}
+
+          {snapshot.budgetMax > 0 && (
+            <FailoverRow
+              service={selectedId}
+              budget={snapshot.budget}
+              budgetMax={snapshot.budgetMax}
+              onAction={onAction}
+            />
+          )}
+
           <div className="stat-row">
             <span className="stat-label">Connections</span>
             <span className="stat-value">
@@ -209,6 +226,98 @@ function LoadBar({ value }: { value: number }) {
         className="bar load-bar"
         style={{ width: `${pct}%`, background: color }}
       />
+    </div>
+  )
+}
+
+function AckPolicyRow({ pool, onAction }: { pool: PoolSnapshot; onAction: RunAction }) {
+  const mode = pool.ackPolicy === 'auto' ? 'auto' : 'manual'
+  const next = mode === 'auto' ? 'manual' : 'auto'
+  return (
+    <div className="stat-row">
+      <span className="stat-label">Ack mode</span>
+      <span className="stat-value">
+        <span className={`mode-chip ${mode === 'auto' ? 'sync' : 'async'}`}>{mode}</span>
+        <button
+          className="mgmt-btn"
+          onClick={() => onAction('set_ack_policy', { queue: pool.queue, policy: next })}
+          aria-label="Toggle acknowledgement mode"
+        >
+          toggle
+        </button>
+      </span>
+    </div>
+  )
+}
+
+function WorkerSlots({
+  pool,
+  service,
+  onAction,
+}: {
+  pool: PoolSnapshot
+  service: string
+  onAction: RunAction
+}) {
+  const live = pool.live ?? []
+  const down: number[] = []
+  for (let i = 0; i < pool.workers; i++) {
+    if (!live.includes(i)) down.push(i)
+  }
+  return (
+    <div className="stat-row">
+      <span className="stat-label">Workers</span>
+      <span className="stat-value worker-slots">
+        {Array.from({ length: pool.workers }, (_, i) => (
+          <span key={i} className={`worker-slot ${down.includes(i) ? 'down' : ''}`}>
+            {i}
+          </span>
+        ))}
+        {down.length > 0 && (
+          <button
+            className="mgmt-btn"
+            onClick={() => onAction('restart_worker', { service, workerId: down[0] })}
+            aria-label={`Restart crashed worker ${down[0]}`}
+            title={`Worker ${down[0]} is down — around 30s to restart`}
+          >
+            restart {down[0]}
+          </button>
+        )}
+      </span>
+    </div>
+  )
+}
+
+function FailoverRow({
+  service,
+  budget,
+  budgetMax,
+  onAction,
+}: {
+  service: string
+  budget: number
+  budgetMax: number
+  onAction: RunAction
+}) {
+  const spent = budgetMax - budget
+  return (
+    <div className="stat-row failover-row">
+      <span className="stat-label">DB failover</span>
+      <span className="stat-value">
+        <span className="budget-pips" aria-label={`${budget} of ${budgetMax} failovers left`}>
+          {Array.from({ length: budgetMax }, (_, i) => (
+            <span key={i} className={`budget-pip ${i < spent ? 'spent' : ''}`} />
+          ))}
+        </span>
+        <button
+          className="mgmt-btn"
+          disabled={budget <= 0}
+          onClick={() => onAction('emergency_db_failover', { service })}
+          aria-label="Trigger emergency DB failover"
+        >
+          {budget > 0 ? `failover (${budget} left)` : 'exhausted'}
+        </button>
+      </span>
     </div>
   )
 }

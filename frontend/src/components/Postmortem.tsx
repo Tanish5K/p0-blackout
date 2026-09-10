@@ -4,6 +4,8 @@ import { formatAgo, formatPct } from '../lib/snapshot'
 interface PostmortemProps {
   outcome: OutcomeSnapshot
   clock: string
+  incidentNumber: number
+  campaignTotal: number
   onClose: () => void
   onRetry: () => void
 }
@@ -16,9 +18,16 @@ function metricOutcome(value: string, stale: boolean, ageMs: number): { value: s
   return { value: stale ? '—' : value, stale, ago }
 }
 
-export function Postmortem({ outcome, clock, onClose, onRetry }: PostmortemProps) {
+export function Postmortem({ outcome, clock, incidentNumber, campaignTotal, onClose, onRetry }: PostmortemProps) {
   const success = metricOutcome(formatPct(outcome.success * 100), outcome.successStale, outcome.successAgeMs)
   const p99 = metricOutcome(`${outcome.p99Ms.toFixed(0)}ms`, outcome.latencyStale, outcome.latencyAgeMs)
+
+  const hasNext = !outcome.failed && incidentNumber < campaignTotal
+  const nextLabel = outcome.failed
+    ? `Retry incident ${incidentNumber}`
+    : hasNext
+      ? `Continue to incident ${incidentNumber + 1}`
+      : 'Run it back'
 
   return (
     <div className="postmortem-overlay" role="dialog" aria-modal="true">
@@ -26,7 +35,11 @@ export function Postmortem({ outcome, clock, onClose, onRetry }: PostmortemProps
         <button className="inspector-close" onClick={onClose} aria-label="Close postmortem">×</button>
 
         <h2 className={outcome.failed ? 'verdict-fail' : 'verdict-pass'}>
-          {outcome.failed ? 'INCIDENT NOT RESOLVED' : 'INCIDENT SURVIVED'}
+          {outcome.failed
+            ? `INCIDENT ${incidentNumber} NOT RESOLVED`
+            : hasNext
+              ? `INCIDENT ${incidentNumber} SURVIVED`
+              : 'CAMPAIGN COMPLETE'}
         </h2>
         {outcome.reason && <p className="postmortem-reason">{outcome.reason}</p>}
 
@@ -66,7 +79,7 @@ export function Postmortem({ outcome, clock, onClose, onRetry }: PostmortemProps
 
         <div className="postmortem-actions">
           <button className="start-button" onClick={onRetry}>
-            {outcome.failed ? 'Play again' : 'Run it back'}
+            {nextLabel}
           </button>
           <button className="postmortem-dismiss" onClick={onClose}>
             Inspect the frozen state
@@ -74,8 +87,10 @@ export function Postmortem({ outcome, clock, onClose, onRetry }: PostmortemProps
         </div>
 
         <p className="postmortem-hint">
-          The backend is paused on this final state — pressing Play again
-          restarts the incident with a clean slate.
+          The backend is paused on this final state —{' '}
+          {hasNext
+            ? 'continuing launches the next incident with a clean slate.'
+            : 'pressing again restarts the incident from scratch.'}
         </p>
       </div>
     </div>

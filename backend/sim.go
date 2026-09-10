@@ -49,12 +49,11 @@ func newQueueCache() *queueCache {
 // the (real, polled) queue depth back into metrics. It also runs the objective
 // evaluator; once a fail triggers or the ramp completes, the generator stops
 // and the final state is left in place (no os.Exit, so the HTTP/WS server and
-// broker connection stay alive for inspection).
-func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.Mgmt, rt *simulation.Runtime, hub *api.Hub, pm *rabbitmq.PoolManager, reg *rabbitmq.Registry, runID int64) {
-	seed := seedFromEnv()
-	profile := stampedeProfileFromEnv()
+// broker connection stay alive for inspection). Returns the terminal Outcome
+// (nil if the run was cancelled externally).
+func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.Mgmt, rt *simulation.Runtime, hub *api.Hub, pm *rabbitmq.PoolManager, reg *rabbitmq.Registry, spec *runSpec) *simulation.Outcome {
 	survive := simulation.IncidentSurviveDuration
-	state := simulation.NewGame(seed, profile)
+	state := simulation.NewGameOpts(spec.seed, spec.profile, spec.options)
 	state.Sim = rt
 
 	cache := newQueueCache()
@@ -63,6 +62,7 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 	go pollQueues(ctx, mgmt, cache, queueNames)
 
 	generatorOn := true
+	var peakWorkers int
 
 	// Phase 5: snapshot carrier. Events are broadcast as a cursor over the
 	// shared log (tick traffic AND player action events), not as the tick's own
@@ -79,20 +79,40 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 // dedup (append only events with tick > last-seen tick), which keys off the
 // previous message's LAST event, keeps the whole sequence.
 adapter := &registryAdapter{reg: reg, state: state}
-actionHandler := api.NewActionHandler(pm, adapter, state.Log, func() int64 { return state.Tick })
+actionHandler := api.NewActionHandler(pm, adapter, adapter, state.Log, func() int64 { return state.Tick })
 hub.SetActionHandler(actionHandler)
+
+	// Incident 2's scripted DB event: the spike is active while elapsed is
+	// inside any milestone window; entering/leaving is a log+event transition
+	// so the tape can tell the story, and while active the driver rolls the
+	// per-tick crash die.
+	var spikeActive bool
+	spikeInWindow := func() (bool, int) {
+		if spec.spike == nil {
+			return false, 0
+		}
+		for i, m := range spec.spike.Milestones {
+			start, end := m, m+spec.spike.Duration
+			if state.Elapsed >= start && state.Elapsed < end {
+				return true, i + 1
+			}
+		}
+		return false, 0
+	}
 
 	t := time.NewTicker(simulation.TickInterval)
 	defer t.Stop()
 
-	log.Printf("simulation started (run=%d, seed=%d, ramp=%s, hold=%s, survive=8:00, fastDB=%s)",
-		runID, seed, profile.Ramp, profile.Hold, os.Getenv("BLACKOUT_FAST_DB"))
+	log.Printf("simulation started: incident %d \"%s\" (run=%d, seed=%d, ramp=%s, hold=%s, survive=8:00, fastDB=%s, identity=%v, cascade=%.2fx)",
+		spec.options.IncidentNumber, spec.options.IncidentName, spec.runID,
+		spec.seed, spec.profile.Ramp, spec.profile.Hold, os.Getenv("BLACKOUT_FAST_DB"),
+		spec.options.IncludeIdentity, spec.options.DBFailureMult)
 
 	for {
 		select {
 		case <-ctx.Done():
 			log.Printf("simulation stopped after %d ticks (%s)", state.Tick, state.Elapsed)
-			return
+			return nil
 		case <-t.C:
 			evs := simulation.Tick(state, simulation.TickInterval)
 			for _, e := range evs {
@@ -105,6 +125,48 @@ hub.SetActionHandler(actionHandler)
 			syncPoolCounts(state, pm)
 			adapter.syncWired(state)
 			state.Log.Trim(maxEvents)
+
+			// Incident 2 spike driver: set/reset the DB latency multiplier on
+			// the transition ticks, roll the crash die while active, and credit
+			// this tick's auto-mode crash loss into the failure counters so the
+			// success rate honestly reflects the "falling workers" churn.
+			if spec.spike != nil {
+				on, wave := spikeInWindow()
+				if on && !spikeActive {
+					spikeActive = true
+					_ = rt.SetDBSpike(spec.spike.Queue, spec.spike.LatMult)
+					state.Log.Append(events.Event{
+						Tick: state.Tick, Time: state.Elapsed, Type: "fail",
+						Subject: spec.spike.Queue,
+						Data:    fmt.Sprintf("db latency spike ×%.0f (wave %d/3)", spec.spike.LatMult, wave),
+					})
+					log.Printf("INCIDENT 2: DB latency spike ×%.0f on %s at %s (wave %d/3)",
+						spec.spike.LatMult, spec.spike.Queue, spec.options.IncidentName, wave)
+				} else if !on && spikeActive {
+					spikeActive = false
+					_ = rt.SetDBSpike(spec.spike.Queue, 1)
+					log.Printf("INCIDENT 2: DB spike cleared on %s at %s", spec.spike.Queue, state.Elapsed.Round(simulation.TickInterval))
+				}
+				if spikeActive {
+					if state.Rng().Float64() < spec.spike.CrashProbPerTick {
+						if err := pm.CrashRandomWorker(spec.spike.Queue); err != nil {
+							// No live worker this instant (pool mid-hold): the
+							// storm is already thinning it; skip quietly.
+							_ = err
+						}
+					}
+				}
+				if lost := pm.DrainCrashedAuto(); lost > 0 {
+					rt.AddFailed(spec.spike.Queue, int(lost))
+				}
+			}
+
+			// Peak pool workers (the campaign-cascade input): sum CONFIGURED
+			// pool sizes, which syncPoolCounts refreshes from the pool manager
+			// (scale_workers / run start / crash-hold reductions).
+			if total := totalWorkers(state); total > peakWorkers {
+				peakWorkers = total
+			}
 
 			// One-shot health floor warnings, fired the tick they cross. The
 			// worst service is named — a bare percentage hides which node the
@@ -139,6 +201,7 @@ hub.SetActionHandler(actionHandler)
 					out = state.Objectives.Complete(state)
 				}
 				if out != nil {
+					out.PeakWorkers = peakWorkers
 					state.Outcome = out
 					state.Timeline = buildTimeline(state, out)
 					generatorOn = false
@@ -151,8 +214,9 @@ hub.SetActionHandler(actionHandler)
 			// wipe its merged state the instant a retry starts (a fresh run
 			// also means prevSnap starts nil here → a full first frame).
 			snap := api.SnapshotFromState(state, !generatorOn)
-			snap.RunID = runID
+			snap.RunID = spec.runID
 			snap.RunStatus = "running"
+			snap.CampaignTotal = spec.campaignTotal
 			if out != nil {
 				snap.RunStatus = "ended"
 			}
@@ -169,10 +233,19 @@ hub.SetActionHandler(actionHandler)
 				// broadcast; stop the tick loop. The HTTP/WS server and broker
 				// connection stay alive for inspection.
 				logOutcome(state, out)
-				return
+				return out
 			}
 		}
 	}
+}
+
+// totalWorkers sums the configured pool sizes shown in the state.
+func totalWorkers(s *simulation.GameState) int {
+	var n int
+	for _, p := range s.Pools {
+		n += p.Workers
+	}
+	return n
 }
 
 // seedFromEnv resolves the deterministic demo seed (BLACKOUT_SEED). Default 42
@@ -230,7 +303,8 @@ func applyRates(s *simulation.GameState, rt *simulation.Runtime) {
 
 // bridgePublish turns this tick's publish plan (decided deterministically by
 // Tick) into real messages on RabbitMQ. Order events fan out to orders.work and
-// analytics.events; a small share becomes payment authorisations. Every
+// analytics.events; a small share becomes payment authorisations. Incident 2
+// adds the synchronous identity hop (identity.events → identity.worker). Every
 // successfully published batch also feeds the load trackers so workers feel
 // the new load immediately — the management snapshot only reconciles drift.
 func bridgePublish(ctx context.Context, pub *rabbitmq.Publisher, s *simulation.GameState) {
@@ -251,6 +325,15 @@ func bridgePublish(ctx context.Context, pub *rabbitmq.Publisher, s *simulation.G
 			appendDropped(s, "payment.events", n, err)
 		} else {
 			s.Sim.AddPublished("payments.work", int(n))
+		}
+	}
+	if s.Traffic.IdentityMessagesThisTick > 0 {
+		n := s.Traffic.IdentityMessagesThisTick
+		bodies := makeBodies(n, "identity.check", s.Tick)
+		if err := publishWithRetry(ctx, pub, "identity.events", "identity.requests", bodies); err != nil {
+			appendDropped(s, "identity.events", n, err)
+		} else {
+			s.Sim.AddPublished("identity.worker", int(n))
 		}
 	}
 }
@@ -324,11 +407,25 @@ func applyCache(c *queueCache, s *simulation.GameState) {
 // source — RabbitMQ's management API "consumers" field — counts basic.consume
 // subscriptions, and each WorkerPool opens exactly ONE consume then dispatches
 // to N goroutines, so it always read 1 no matter how many workers were added.
-// Intent is the truth here; broker telemetry only reports queue depth.
+// Intent is the truth here; broker telemetry only reports queue depth. It also
+// mirrors the live ack mode and per-worker slot view the Inspector needs.
 func syncPoolCounts(s *simulation.GameState, pm *rabbitmq.PoolManager) {
 	for i := range s.Pools {
-		s.Pools[i].Workers = pm.Workers(s.Pools[i].Queue)
+		q := s.Pools[i].Queue
+		s.Pools[i].Workers = pm.Workers(q)
+		s.Pools[i].AckPolicy = pm.AckPolicy(q)
+		s.Pools[i].WorkerDetail = toWorkerDetail(pm.PoolReport(q))
 	}
+}
+
+// toWorkerDetail adapts the pool manager's live per-worker report into the
+// simulation's WorkerDetail shape (same fields, decoupled packages).
+func toWorkerDetail(rep []rabbitmq.WorkerReport) []simulation.WorkerDetail {
+	out := make([]simulation.WorkerDetail, 0, len(rep))
+	for _, w := range rep {
+		out = append(out, simulation.WorkerDetail{ID: w.ID, Msg: w.Msg})
+	}
+	return out
 }
 
 // pollQueues is a separate goroutine that samples the management API on a slow
@@ -494,6 +591,27 @@ func (a *registryAdapter) SetSynchronous(id string, sync bool) bool {
 		}
 	}
 	return false
+}
+
+// BudgetGate: emergency_db_failover drains the incident's failover budget and
+// hands the live queue to the simulation's failover override (latency drops ~5x
+// on a degraded replica with its own inconsistency + residual error). The
+// budget is GameState.Budget: spending here is visible in the snapshot, and an
+// exhausted budget rejects further failovers.
+func (a *registryAdapter) BudgetLeft() int {
+	return a.state.Budget
+}
+
+func (a *registryAdapter) SpendBudget() bool {
+	if a.state.Budget <= 0 {
+		return false
+	}
+	a.state.Budget--
+	return true
+}
+
+func (a *registryAdapter) Failover(queue string) error {
+	return a.state.Sim.Failover(queue, simulation.FailoverLease)
 }
 
 // syncWired refreshes each simulation service's Wired flag from the live

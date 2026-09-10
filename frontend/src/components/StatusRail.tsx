@@ -34,6 +34,12 @@ export function StatusRail({ status, error, snapshot, runControl }: StatusRailPr
 
       <div className="rail-objectives">{(snapshot.objectives ?? []).map((o) => <Objective o={o} key={o.id} />)}</div>
 
+      {snapshot.budgetMax > 0 && (
+        <span className={`pill budget ${snapshot.budget <= 0 ? 'empty' : ''}`} title="Emergency DB failovers remaining this incident">
+          db failover {snapshot.budget}/{snapshot.budgetMax}
+        </span>
+      )}
+
       {snapshot.runStatus === 'ended' && (
         <button className="pill pill-btn" onClick={() => runControl('retry')}>
           play again

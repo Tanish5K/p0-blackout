@@ -29,7 +29,8 @@ const (
 
 // defaultWorkerCounts returns the starting consumer count per queue for every
 // incident (Incident 1 PLAYTEST PASS 2): comfortable pressure at launch so
-// strain builds in the final minutes rather than from second one.
+// strain builds in the final minutes rather than from second one. Incident 2
+// drops Identity on top of this set in buildSpec.
 func defaultWorkerCounts() map[string]int {
 	return map[string]int{
 		"orders.work":      6,
@@ -60,6 +61,16 @@ type RunController struct {
 	status    RunStatus
 	cancelRun context.CancelFunc
 	doneRun   chan struct{}
+
+	// Campaign position: which incident the NEXT begin() starts. Advances on a
+	// survived run; a failed run keeps the player on the same incident.
+	incidentIdx int
+	// dbMult is the campaign DB-failure cascade multiplier (start 1.0) seeded
+	// into every DB before Incident 2: aggressive Incident 1 scaling raises it,
+	// and Incident 2's DB failure chance is then seeded from it (see
+	// simulation.DB.SetFailureMult). lastCascadeStep is the last bump (log).
+	dbMult          float64
+	lastCascadeStep float64
 }
 
 // NewRunController wires the controller to every bridge/messaging dependency.
@@ -74,30 +85,94 @@ func NewRunController(
 	reg *rabbitmq.Registry,
 ) *RunController {
 	return &RunController{
-		ctx:    ctx,
-		broker: broker,
-		pub:    pub,
-		mgmt:   mgmt,
-		rt:     rt,
-		hub:    hub,
-		pm:     pm,
-		reg:    reg,
-		status: RunIdle,
+		ctx:     ctx,
+		broker:  broker,
+		pub:     pub,
+		mgmt:    mgmt,
+		rt:      rt,
+		hub:     hub,
+		pm:      pm,
+		reg:     reg,
+		status:  RunIdle,
+		dbMult:  1.0,
 	}
+}
+
+// currentIncident returns the campaign incident the NEXT begin() will start.
+func (c *RunController) currentIncident() *Incident {
+	c.mu.Lock()
+	idx := c.incidentIdx
+	c.mu.Unlock()
+	if idx < 0 || idx >= len(campaign) {
+		idx = 0
+	}
+	return &campaign[idx]
+}
+
+func (c *RunController) dbFailureMult() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dbMult
+}
+
+func (c *RunController) cascadeStep() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastCascadeStep
+}
+
+func (c *RunController) campLength() int {
+	return len(campaign)
+}
+
+// settleLine applies the campaign-cascade rule after a run's outcome lands:
+// surviving Incident 1 with peak total workers >= the cascade threshold raises
+// the multiplier Incident 2's DBs are seeded from (capped), modelling "your
+// scaling is what shook the shared DB loose". Expected value below the
+// threshold is left untouched, so restrained play is NOT punished. Called only
+// on a survived incident-1 run (the campaign advance point).
+func (c *RunController) settleCascade(peak int) {
+	const cascadeThreshold = 14 // peak total configured workers
+	if peak < cascadeThreshold {
+		return
+	}
+	c.mu.Lock()
+	next := c.dbMult * 1.5
+	if next > 2.0 {
+		next = 2.0
+	}
+	c.lastCascadeStep = next - c.dbMult
+	c.dbMult = next
+	mult := c.dbMult
+	c.mu.Unlock()
+	log.Printf("campaign: incident 1 survived with peak %d workers >= %d → incident 2 DB cascade multiplier %.2fx (last step +%.2fx)",
+		peak, cascadeThreshold, mult, c.lastCascadeStep)
 }
 
 // Boot broadcasts the idle state so a freshly-connected game screen has a
 // complete snapshot (runId 0, runStatus "idle") before any run starts.
 func (c *RunController) Boot() {
 	c.broadcastRunFrame(0, RunIdle)
-	log.Printf("simulation idle — awaiting \"start\" over /ws (set BLACKOUT_AUTOSTART=1 for boot-and-run)")
+	log.Printf("simulation idle — campaign %d/%d awaiting \"start\" over /ws (set BLACKOUT_AUTOSTART=1 for boot-and-run)",
+		c.currentIncident().Number, len(campaign))
 }
 
 // frozenState builds a pristine, never-ticked GameState for the idle / first
 // frame broadcasts (defaults: health 100, load 0, objectives seeded). It is
-// rebuilt per call so successive broadcasts never share mutation.
-func frozenState() *simulation.GameState {
-	return simulation.NewGame(seedFromEnv(), stampedeProfileFromEnv())
+// rebuilt per call so successive broadcasts never share mutation. The incident
+// identity (number/name/budget) mirrors whatever campaign position is current.
+func (c *RunController) frozenState() *simulation.GameState {
+	inc := c.currentIncident()
+	return simulation.NewGameOpts(seedFromEnv(), stampedeProfileFromEnv(), simulation.GameOptions{
+		Budget:          inc.Budget,
+		BudgetMax:       inc.BudgetMax,
+		IncidentNumber:  inc.Number,
+		IncidentName:    inc.Name,
+		IncidentDesc:    inc.Desc,
+		IncludeIdentity: inc.IncludeIdentity,
+		DBFailureMult:   c.dbFailureMult(),
+		ObjectiveItems:  inc.Objectives,
+	})
 }
 
 // Start begins a run. Like Retry it errors if a run is already running (a
@@ -127,6 +202,8 @@ func (c *RunController) begin() error {
 	c.cancelRun, c.doneRun = nil, nil
 	c.mu.Unlock()
 
+	spec := c.buildSpec(runID)
+
 	// --- 1. Old-run teardown, fully COMPLETED before anything new starts. ---
 	// Cancellation is async: a stray tick or consumer callback from the old
 	// run must not race the new run's resets, so we cancel and then WAIT for
@@ -143,15 +220,24 @@ func (c *RunController) begin() error {
 
 	// Domino order so no old worker can write into fresh state:
 	//   pools first (Reset waits per-pool for handlers to finish),
-	//   then queue purge,
 	//   then runtime + registry resets,
+	//   then wire this incident's new service (Incident 2: identity),
+	//   then queue purge (covers the newly-wired queue too),
 	//   then settle the pools at the reset worker set.
-	c.pm.Reset(defaultWorkerCounts())
+	c.pm.Reset(spec.counts)
+	c.rt.Reset(simulation.RuntimeOpts{
+		IncludeIdentity: spec.options.IncludeIdentity,
+		FailureMult:     spec.options.DBFailureMult,
+	})
+	c.reg.ResetWired()
+	if spec.options.IncludeIdentity {
+		if !c.reg.SetWired("identity", true) {
+			log.Printf("run controller: identity wiring no-op (already wired)")
+		}
+	}
 	if err := purgeQueues(c.ctx, c.broker, c.reg.WiredQueues()); err != nil {
 		log.Printf("run controller: queue purge failed (%v); continuing", err)
 	}
-	c.rt.Reset()
-	c.reg.ResetWired()
 	c.pm.Reconcile()
 
 	// --- 2. Launch the fresh run. ------------------------------------------
@@ -165,8 +251,8 @@ func (c *RunController) begin() error {
 
 	go func() {
 		defer close(doneCh)
-		runSimulation(child, c.pub, c.mgmt, c.rt, c.hub, c.pm, c.reg, runID)
-		c.finish(runID)
+		out := runSimulation(child, c.pub, c.mgmt, c.rt, c.hub, c.pm, c.reg, spec)
+		c.finish(runID, out)
 	}()
 
 	// Broadcast an immediate "running" frame (defaults until tick 1 lands
@@ -178,8 +264,9 @@ func (c *RunController) begin() error {
 // finish marks the controller idle-of-run when the run launched with the given
 // ID returns (either a terminal outcome broadcast by runSimulation or an
 // external cancel). A newer run that already claimed the controller is left
-// untouched.
-func (c *RunController) finish(id int64) {
+// untouched. On a SURVIVED run the campaign advances to the next incident (and
+// the cascade rule books Incident 1's scaling cost); a failed run stays put.
+func (c *RunController) finish(id int64, out *simulation.Outcome) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if id != c.runId {
@@ -188,15 +275,27 @@ func (c *RunController) finish(id int64) {
 	c.status = RunEnded
 	c.cancelRun = nil
 	c.doneRun = nil
+
+	if out == nil {
+		return // externally cancelled; no campaign consequence
+	}
+	if !out.Failed && c.incidentIdx < len(campaign)-1 {
+		c.settleCascade(out.PeakWorkers)
+		c.incidentIdx++
+		next := campaign[c.incidentIdx]
+		log.Printf("campaign: incident %d \"%s\" SURVIVED → next up: %d \"%s\"",
+			out.FinalTicks, campaign[c.incidentIdx-1].Name, next.Number, next.Name)
+	}
 }
 
 // broadcastRunFrame sends a full, never-mutated snapshot tagged with the given
 // run identity and status.
 func (c *RunController) broadcastRunFrame(runID int64, st RunStatus) {
-	snap := api.SnapshotFromState(frozenState(), false)
+	snap := api.SnapshotFromState(c.frozenState(), false)
 	snap.Phase = string(st)
 	snap.RunID = runID
 	snap.RunStatus = string(st)
+	snap.CampaignTotal = c.campLength()
 	snap.Events = nil
 	if data, err := api.MarshalSnapshot(&snap); err == nil {
 		c.hub.Broadcast(data)

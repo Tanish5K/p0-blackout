@@ -25,6 +25,16 @@ export interface SnapshotMessage {
   // runStatus drives the start-overlay / postmortem gating: "idle" before the
   // first Start, "running" during play, "ended" once the outcome fired.
   runStatus?: RunStatus
+  // Incident identifies the live scenario + the shared emergency budget: the
+  // budget counts DB failovers remaining per incident (spending shows here).
+  // CampaignTotal is how many incidents the campaign holds; the client maps
+  // incidentNumber → "retry" when failed, "continue to N+1" after a survive.
+  incidentNumber?: number
+  incidentName?: string
+  incidentDesc?: string
+  budget?: number
+  budgetMax?: number
+  campaignTotal?: number
   services?: ServiceSnapshot[]
   queues?: QueueSnapshot[]
   pools?: PoolSnapshot[]
@@ -70,6 +80,12 @@ export interface QueueSnapshot {
 export interface PoolSnapshot {
   queue: string
   workers: number
+  // Acknowledgement mode ("manual"|"auto"), the Incident 2 lever: manual keeps a
+  // crashed worker's in-flight message redeliverable, auto loses it (provable).
+  ackPolicy?: string
+  // Slot ids currently running (one fewer than `workers` while a crashed slot
+  // holds). The id missing from [0, workers-1] is the one stuck restarting.
+  live?: number[]
 }
 
 export interface LatencyMs {
@@ -137,6 +153,12 @@ export interface MergedSnapshot {
   phase: Phase
   runId: number
   runStatus: RunStatus
+  incidentNumber: number
+  incidentName: string
+  incidentDesc: string
+  budget: number
+  budgetMax: number
+  campaignTotal: number
   services: ServiceSnapshot[]
   queues: QueueSnapshot[]
   pools: PoolSnapshot[]

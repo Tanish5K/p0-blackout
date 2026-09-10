@@ -23,6 +23,12 @@ export function emptySnapshot(): MergedSnapshot {
     phase: 'idle',
     runId: 0,
     runStatus: 'idle',
+    incidentNumber: 1,
+    incidentName: '',
+    incidentDesc: '',
+    budget: 0,
+    budgetMax: 0,
+    campaignTotal: 1,
     services: [],
     queues: [],
     pools: [],
@@ -63,6 +69,12 @@ export function mergeSnapshot(prev: MergedSnapshot, update: SnapshotMessage): Me
     phase: update.phase,
     runId: update.runId ?? prev.runId,
     runStatus: update.runStatus ?? prev.runStatus,
+    incidentNumber: update.incidentNumber ?? prev.incidentNumber,
+    incidentName: update.incidentName ?? prev.incidentName,
+    incidentDesc: update.incidentDesc ?? prev.incidentDesc,
+    budget: update.budget ?? prev.budget,
+    budgetMax: update.budgetMax ?? prev.budgetMax,
+    campaignTotal: update.campaignTotal ?? prev.campaignTotal,
     services: update.services ?? prev.services,
     queues: update.queues ?? prev.queues,
     pools: update.pools ?? prev.pools,
@@ -84,6 +96,12 @@ function freshRun(prev: MergedSnapshot, update: SnapshotMessage): MergedSnapshot
     phase: update.phase,
     runId: update.runId ?? prev.runId + 1,
     runStatus: update.runStatus ?? prev.runStatus,
+    incidentNumber: update.incidentNumber ?? prev.incidentNumber,
+    incidentName: update.incidentName ?? prev.incidentName,
+    incidentDesc: update.incidentDesc ?? prev.incidentDesc,
+    budget: update.budget ?? prev.budget,
+    budgetMax: update.budgetMax ?? prev.budgetMax,
+    campaignTotal: update.campaignTotal ?? prev.campaignTotal,
     services: update.services ?? prev.services,
     queues: update.queues ?? prev.queues,
     pools: update.pools ?? prev.pools,
@@ -144,6 +162,12 @@ export function lerpSnapshot(
   const phase = b.phase
   const runId = b.runId
   const runStatus = b.runStatus
+  const incidentNumber = b.incidentNumber
+  const incidentName = b.incidentName
+  const incidentDesc = b.incidentDesc
+  const budget = b.budget
+  const budgetMax = b.budgetMax
+  const campaignTotal = b.campaignTotal
 
   // Arrays: lerp in-place, fall back to a if b doesn't carry it
   const services = lerpServices(a.services, b.services, c)
@@ -154,7 +178,7 @@ export function lerpSnapshot(
   const outcome = b.outcome
   const events = b.events // always latest events (never interpolated)
 
-  return { tick, clock, phase, runId, runStatus, services, queues, pools, metrics, objectives, outcome, events }
+  return { tick, clock, phase, runId, runStatus, incidentNumber, incidentName, incidentDesc, budget, budgetMax, campaignTotal, services, queues, pools, metrics, objectives, outcome, events }
 }
 
 function lerpServices(
@@ -236,12 +260,14 @@ function lerpPools(
     out.push({
       queue: pb.queue || pa.queue,
       workers: t >= 0.5 ? pb.workers : pa.workers, // snap (discrete)
+      ackPolicy: t >= 0.5 ? pb.ackPolicy : pa.ackPolicy, // snap (enum)
+      live: t >= 0.5 ? pb.live : pa.live, // snap (slot view)
     })
   }
   return out
 }
 
-const STUB_POOL: PoolSnapshot = { queue: '', workers: 0 }
+const STUB_POOL: PoolSnapshot = { queue: '', workers: 0, ackPolicy: '', live: [] }
 
 function lerpMetrics(a: MetricsSnapshot, b: MetricsSnapshot, t: number): MetricsSnapshot {
   return {
@@ -314,6 +340,7 @@ export function formatDepth(v: number): string {
 const SERVICE_QUEUE_MAP: Record<string, string> = {
   orders: 'orders.work',
   payments: 'payments.work',
+  identity: 'identity.worker',
   analytics: 'analytics.events',
 }
 

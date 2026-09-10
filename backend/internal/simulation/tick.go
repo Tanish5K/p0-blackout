@@ -35,6 +35,16 @@ func Tick(s *GameState, dt time.Duration) []events.Event {
 	payIn := int64(float64(reqs) * payFrac)
 	s.Traffic.OrderMessagesThisTick = reqs
 	s.Traffic.PayMessagesThisTick = payIn
+	s.Traffic.IdentityMessagesThisTick = 0
+	var idIn int64
+	// Incident 2 rides the same surge curve but adds a synchronous identity
+	// hop: a share of inbound requests must also pass identity.worker before
+	// the gateway can complete. The share is modest so identity reads as
+	// pressure-amplifier, not the whole story (the crash storm is the point).
+	if s.IncludeIdentity {
+		idIn = int64(float64(reqs) * IdentityShare)
+		s.Traffic.IdentityMessagesThisTick = idIn
+	}
 
 	if reqs > 0 {
 		evs = append(evs, events.Event{
@@ -50,6 +60,12 @@ func Tick(s *GameState, dt time.Duration) []events.Event {
 		evs = append(evs, events.Event{
 			Tick: s.Tick, Time: s.Elapsed, Type: "route", Subject: "payment.events",
 			Value: float64(payIn), Data: "payments.work",
+		})
+	}
+	if idIn > 0 {
+		evs = append(evs, events.Event{
+			Tick: s.Tick, Time: s.Elapsed, Type: "route", Subject: "identity.events",
+			Value: float64(idIn), Data: "identity.worker",
 		})
 	}
 

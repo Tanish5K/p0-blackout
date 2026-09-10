@@ -29,6 +29,30 @@ type GameState struct {
 	Pools    []PoolState
 	Metrics  Metrics
 
+	// Budget is the incident's emergency-ability budget (Incident 2's
+	// failover-fund). Spent by player actions; a live snapshot field so the
+	// frontend can show how many escalations remain. BudgetMax is the starting
+	// budget (spent value is Budget/BudgetMax).
+	Budget   int
+	BudgetMax int
+
+	// Incident fields tag every state with the campaign position so
+	// snapshots and the idle/briefing frames can identify which incident the
+	// screen is preparing. Supply via GameOptions on construction.
+	IncidentNumber int
+	IncidentName   string
+	IncidentDesc   string
+
+	// IncludeIdentity scaffolds the Identity service/queue/pool into the state.
+	// Incident 2 flips this on; Incident 1 models the four wired services only.
+	IncludeIdentity bool
+
+	// dbFailureMult is the campaign cascade floor (start 1.0): aggressive
+	// Incident 1 scaling raises it, and Incident 2's DB failure chance is
+	// seeded from it (see DB.SetFailureMult).
+	dbFailureMult float64
+	cascadeStep   float64 // how much the last run bumped the multiplier (log/verification)
+
 	// Objectives owns the scenario objective set (state.driver uses
 	// state.Objectives.Tick/Complete). Kept on the state so snapshot builders
 	// can surface live objective status without a second code path.
@@ -64,6 +88,9 @@ type TrafficState struct {
 	// are excluded from JSON snapshots: they are not frontend display data.
 	OrderMessagesThisTick int64 `json:"-"`
 	PayMessagesThisTick   int64 `json:"-"`
+	// IdentityMessagesThisTick is Incident 2's synchronous identity share of the
+	// inbound flow (0 when Identity is not part of the incident).
+	IdentityMessagesThisTick int64 `json:"-"`
 
 	WinIn  []int64 // rolling window of request counts per tick (rate-in)
 	WinOut []int64 // rolling window of processed counts per tick (rate-out)
@@ -124,6 +151,20 @@ type QueueState struct {
 type PoolState struct {
 	Queue   string `json:"queue"`
 	Workers int    `json:"workers"`
+	// AckPolicy mirrors the pool manager's per-queue acknowledgement mode
+	// ("manual" | "auto"). The driver copies it in so the frontend's pool rows
+	// can show/toggle it without a second source of truth.
+	AckPolicy string `json:"ackPolicy"`
+	// WorkerDetail is the live per-worker view (currently-held message id)
+	// pulled from the pool manager, used by the Inspector's worker rows.
+	WorkerDetail []WorkerDetail `json:"workerDetail"`
+}
+
+// WorkerDetail is one consumer's live view: its worker id and the message it
+// is currently processing ("" = idle).
+type WorkerDetail struct {
+	ID  int    `json:"id"`
+	Msg string `json:"msg"`
 }
 
 // Metrics are the derived operational numbers surfaced to the ops rail.
@@ -149,22 +190,68 @@ type Metrics struct {
 	SuccessAgeMs  float64 `json:"-"`
 }
 
-// NewGame builds a fresh, seeded GameState for a profile.
+// GameOptions carries the per-incident choices that shape a GameState beyond
+// the base profile: whether Identity is scaffolded in (Incident 2), the
+// emergency budget, the campaign DB-failure cascade multiplier, and the
+// incident identity for snapshots/briefings.
+type GameOptions struct {
+	Budget          int
+	BudgetMax       int
+	IncidentNumber  int
+	IncidentName    string
+	IncidentDesc    string
+	IncludeIdentity bool
+	DBFailureMult   float64
+	CascadeStep     float64
+	// ObjectiveItems overrides the incident objective set (defaults to the
+	// Incident 1 aggregate floors + survive). Incident 2 adds per-critical
+	// service stability floors here.
+	ObjectiveItems []Objective
+}
+
+// NewGame builds a fresh, seeded GameState for a profile (Incident 1 defaults).
 func NewGame(seed int64, profile TrafficProfile) *GameState {
+	return NewGameOpts(seed, profile, GameOptions{
+		Budget: 2, BudgetMax: 2, IncidentNumber: 1,
+		IncidentName: "The Great Stampede",
+		IncidentDesc: "Ride out the stampede — a traffic surge floods the order path for 8:00.",
+	})
+}
+
+// NewGameOpts builds a fresh, seeded GameState for the given options.
+func NewGameOpts(seed int64, profile TrafficProfile, opts GameOptions) *GameState {
 	if seed == 0 {
 		seed = 1
 	}
+	if opts.DBFailureMult <= 0 {
+		opts.DBFailureMult = 1
+	}
+	if opts.BudgetMax <= 0 {
+		opts.BudgetMax = opts.Budget
+	}
 	win := make([]int64, 0, WindowSize)
 	s := &GameState{
-		Seed:    seed,
-		Tick:    0,
-		rng:     rand.New(rand.NewSource(seed)),
-		profile: profile,
-		Traffic: TrafficState{RatePerSec: profile.RateAt(0), WinIn: win, WinOut: win},
-		Log:     events.NewLog(),
+		Seed:            seed,
+		Tick:            0,
+		rng:             rand.New(rand.NewSource(seed)),
+		profile:         profile,
+		Traffic:         TrafficState{RatePerSec: profile.RateAt(0), WinIn: win, WinOut: win},
+		Log:             events.NewLog(),
+		Budget:          opts.Budget,
+		BudgetMax:       opts.BudgetMax,
+		IncidentNumber:  opts.IncidentNumber,
+		IncidentName:    opts.IncidentName,
+		IncidentDesc:    opts.IncidentDesc,
+		IncludeIdentity: opts.IncludeIdentity,
+		dbFailureMult:   opts.DBFailureMult,
+		cascadeStep:     opts.CascadeStep,
 	}
-	s.resetServices(profile)
-	s.Objectives = NewObjectives()
+	s.resetServices(profile, opts)
+	if len(opts.ObjectiveItems) > 0 {
+		s.Objectives = NewObjectivesWith(opts.ObjectiveItems)
+	} else {
+		s.Objectives = NewObjectives()
+	}
 	return s
 }
 
@@ -173,7 +260,7 @@ func (s *GameState) Rng() *rand.Rand { return s.rng }
 
 // resetServices initializes the Lumen services, queues, and worker pools that
 // the simulation models. Idempotent on construction.
-func (s *GameState) resetServices(profile TrafficProfile) {
+func (s *GameState) resetServices(profile TrafficProfile, opts GameOptions) {
 	s.Services = []ServiceState{
 		{ID: "gateway", Load: 0, Health: 100, Status: StatusHealthy, Wired: true},
 		{ID: "orders", Load: 0, Health: 100, Status: StatusHealthy, Wired: true, Synchronous: true},
@@ -185,6 +272,11 @@ func (s *GameState) resetServices(profile TrafficProfile) {
 		{Name: "analytics.events"},
 		{Name: "payments.work"},
 	}
+	if opts.IncludeIdentity {
+		s.Services = append(s.Services,
+			ServiceState{ID: "identity", Load: 0, Health: 100, Status: StatusHealthy, Wired: true, Synchronous: true})
+		s.Queues = append(s.Queues, QueueState{Name: "identity.worker"})
+	}
 	// Default pool sizes mirror the driver's defaultWorkerCounts() so the first
 	// frames match reality before syncPoolCounts stamps them with the pool
 	// manager's authoritative counts. PLAYTEST PASS 2: comfortable starting
@@ -193,6 +285,9 @@ func (s *GameState) resetServices(profile TrafficProfile) {
 		{Queue: "orders.work", Workers: 6},
 		{Queue: "analytics.events", Workers: 6},
 		{Queue: "payments.work", Workers: 4},
+	}
+	if opts.IncludeIdentity {
+		s.Pools = append(s.Pools, PoolState{Queue: "identity.worker", Workers: 4})
 	}
 	s.Metrics = Metrics{
 		LatencyP50:   0,

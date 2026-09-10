@@ -18,6 +18,7 @@ import (
 
 type fakePool struct {
 	counts map[string]int
+	acks   map[string]string
 }
 
 func newFakePool() *fakePool {
@@ -25,6 +26,8 @@ func newFakePool() *fakePool {
 		"orders.work":      3,
 		"analytics.events": 2,
 		"payments.work":    2,
+	}, acks: map[string]string{
+		"orders.work": string(rabbitmq.AckManual),
 	}}
 }
 
@@ -39,6 +42,56 @@ func (f *fakePool) Scale(queue string, workers int) error {
 func (f *fakePool) Workers(queue string) int {
 	return f.counts[queue]
 }
+
+func (f *fakePool) SetAckPolicy(queue, policy string) error {
+	if _, ok := f.counts[queue]; !ok {
+		return fmt.Errorf("unknown queue %q", queue)
+	}
+	if policy != string(rabbitmq.AckManual) && policy != string(rabbitmq.AckAuto) {
+		return fmt.Errorf("invalid policy %q", policy)
+	}
+	f.acks[queue] = policy
+	return nil
+}
+
+func (f *fakePool) AckPolicy(queue string) string {
+	return f.acks[queue]
+}
+
+func (f *fakePool) RestartWorker(queue string, workerID int) error {
+	if _, ok := f.counts[queue]; !ok {
+		return fmt.Errorf("unknown queue %q", queue)
+	}
+	return nil
+}
+
+func (f *fakePool) RestartRandomWorker(queue string) error {
+	if _, ok := f.counts[queue]; !ok {
+		return fmt.Errorf("unknown queue %q", queue)
+	}
+	return nil
+}
+
+type fakeBudget struct {
+	left    int
+	failovers map[string]int
+}
+
+func newFakeBudget(left int) *fakeBudget {
+	return &fakeBudget{left: left, failovers: make(map[string]int)}
+}
+
+func (b *fakeBudget) BudgetLeft() int { return b.left }
+
+func (b *fakeBudget) SpendBudget() bool {
+	if b.left <= 0 {
+		return false
+	}
+	b.left--
+	return true
+}
+
+func (b *fakeBudget) Failover(queue string) error { b.failovers[queue]++; return nil }
 
 type fakeReg struct {
 	services map[string]*ServiceState
@@ -91,7 +144,7 @@ func (f *fakeReg) SetSynchronous(id string, sync bool) bool {
 func newTestHandler(pm PoolScaler, reg ServiceReg) ActionHandler {
 	log := events.NewLog()
 	tick := int64(42)
-	return NewActionHandler(pm, reg, log, func() int64 { return tick })
+	return NewActionHandler(pm, reg, newFakeBudget(99), log, func() int64 { return tick })
 }
 
 func send(h ActionHandler, msg IncomingMessage) ActionResult {
@@ -305,8 +358,10 @@ func TestToggleAnalytics(t *testing.T) {
 }
 
 func TestAllStubsReturnOK(t *testing.T) {
+	// restart_worker and set_ack_policy are now live handlers (see their own
+	// tests); the remaining table is the still-stubbed future controls.
 	stubs := []string{
-		"restart_worker", "set_ack_policy", "set_retry_policy",
+		"set_retry_policy",
 		"route_to_dlq", "set_exchange_type", "add_binding",
 		"remove_binding", "set_priority",
 		"use_freeze_frame",
@@ -425,10 +480,115 @@ func TestStubActionsRejected(t *testing.T) {
 	}
 }
 
+func TestSetAckPolicy(t *testing.T) {
+	pm := newFakePool()
+	h := newTestHandler(pm, newFakeReg())
+
+	r := send(h, IncomingMessage{
+		Type:    "action",
+		Action:  "set_ack_policy",
+		Payload: json.RawMessage(`{"queue":"orders.work","policy":"auto"}`),
+	})
+	if !r.OK {
+		t.Fatalf("expected ok, got %+v", r)
+	}
+	if pm.AckPolicy("orders.work") != "auto" {
+		t.Fatalf("policy not applied: %+v", pm.acks)
+	}
+
+	for _, bad := range []string{
+		`{"queue":"nope.work","policy":"auto"}`,
+		`{"queue":"orders.work","policy":"sideways"}`,
+		`{}`,
+	} {
+		r := send(h, IncomingMessage{Type: "action", Action: "set_ack_policy", Payload: json.RawMessage(bad)})
+		if r.OK {
+			t.Errorf("expected rejection for %s, got OK", bad)
+		}
+	}
+}
+
+func TestRestartWorker(t *testing.T) {
+	pm := newFakePool()
+	h := newTestHandler(pm, newFakeReg())
+
+	// Specific worker id.
+	r := send(h, IncomingMessage{
+		Type:    "action",
+		Action:  "restart_worker",
+		Payload: json.RawMessage(`{"service":"orders","workerId":0}`),
+	})
+	if !r.OK {
+		t.Fatalf("expected ok, got %+v", r)
+	}
+	// No worker id → random.
+	r = send(h, IncomingMessage{
+		Type:    "action",
+		Action:  "restart_worker",
+		Payload: json.RawMessage(`{"service":"payments"}`),
+	})
+	if !r.OK {
+		t.Fatalf("expected ok, got %+v", r)
+	}
+	// Unknown service rejected.
+	r = send(h, IncomingMessage{
+		Type:    "action",
+		Action:  "restart_worker",
+		Payload: json.RawMessage(`{"service":"notifications"}`),
+	})
+	if r.OK {
+		t.Fatal("expected rejection for unknown service")
+	}
+}
+
+func TestDBFailoverBudget(t *testing.T) {
+	pm := newFakePool()
+	budget := newFakeBudget(2)
+	log := events.NewLog()
+	tick := int64(42)
+	h := NewActionHandler(pm, newFakeReg(), budget, log, func() int64 { return tick })
+
+	fo := func() ActionResult {
+		return send(h, IncomingMessage{
+			Type:    "action",
+			Action:  "emergency_db_failover",
+			Payload: json.RawMessage(`{"service":"orders"}`),
+		})
+	}
+
+	// Two uses succeed and drain the budget.
+	if r := fo(); !r.OK {
+		t.Fatalf("first failover rejected: %+v", r)
+	}
+	if r := fo(); !r.OK {
+		t.Fatalf("second failover rejected: %+v", r)
+	}
+	if budget.failovers["orders.work"] != 2 {
+		t.Fatalf("expected 2 failovers on orders.work, got %+v", budget.failovers)
+	}
+	if budget.BudgetLeft() != 0 {
+		t.Fatalf("budget not drained: %d left", budget.BudgetLeft())
+	}
+	// Exhausted → rejected with the budget message.
+	r := fo()
+	if r.OK || r.Error != "no emergency-budget remaining"+
+		" (2 DB failovers per incident; the spikes return without it)" {
+		t.Fatalf("expected budget-exhausted rejection, got %+v", r)
+	}
+	// Unknown service rejected and does NOT spend.
+	if r := send(h, IncomingMessage{
+		Type:    "action",
+		Action:  "emergency_db_failover",
+		Payload: json.RawMessage(`{"service":"notifications"}`),
+	}); r.OK {
+		t.Fatal("expected rejection for unknown service")
+	}
+}
+
 func TestActionLogged(t *testing.T) {
 	log := events.NewLog()
 	tick := int64(99)
-	h := NewActionHandler(newFakePool(), newFakeReg(), log, func() int64 { return tick })
+	h := NewActionHandler(newFakePool(), newFakeReg(), newFakeBudget(99), log, func() int64 { return tick })
 
 	h(rawmsg("scale_workers", `{"service":"orders","delta":1}`))
 
@@ -541,7 +701,7 @@ func setupIntTest(t *testing.T) *intTestDeps {
 	adapter := &regAdapter{reg: reg, modes: map[string]bool{"orders": true}}
 	actionLog := events.NewLog()
 	tick := int64(100)
-	actionHandler := NewActionHandler(pm, adapter, actionLog, func() int64 { return tick })
+	actionHandler := NewActionHandler(pm, adapter, newFakeBudget(99), actionLog, func() int64 { return tick })
 
 	return &intTestDeps{
 		broker:    broker,
@@ -747,8 +907,8 @@ func TestInt_AllActionsAccepted(t *testing.T) {
 		{"pause_service", `{"service":"analytics"}`},
 		{"resume_service", `{"service":"analytics"}`},
 		{"toggle_analytics", `{}`},
-		{"restart_worker", `{}`},
-		{"set_ack_policy", `{}`},
+		{"restart_worker", `{"service":"orders"}`},
+		{"set_ack_policy", `{"queue":"orders.work","policy":"manual"}`},
 		{"set_retry_policy", `{}`},
 		{"route_to_dlq", `{}`},
 		{"set_exchange_type", `{}`},
