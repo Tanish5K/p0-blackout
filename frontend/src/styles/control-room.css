@@ -853,3 +853,23 @@ body {
   cursor: pointer;
 }
 .postmortem-dismiss:hover { color: var(--text); border-color: var(--line); }
+
+/* ── Action acknowledgement ───────────────────────────────────────── */
+
+.action-feedback {
+  position: fixed;
+  right: 18px;
+  bottom: calc(var(--tape-h) + 18px);
+  z-index: calc(var(--z-drawer) + 5);
+  max-width: min(420px, calc(100vw - 36px));
+  padding: 9px 12px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--cyan);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.28);
+}
+.action-feedback.ok { border-left-color: var(--ok); }
+.action-feedback.error { border-left-color: var(--danger); }

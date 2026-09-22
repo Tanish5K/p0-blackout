@@ -1,6 +1,8 @@
 import { useEffect, useCallback, useReducer, useRef } from 'react'
 import type {
+  ActionFeedback,
   ActionMessage,
+  ActionResultMessage,
   ConnectionState,
   ControlMessage,
   RunAction,
@@ -16,6 +18,8 @@ type Action =
   | { type: 'OPEN' }
   | { type: 'HELLO' }
   | { type: 'SNAPSHOT'; snapshot: SnapshotMessage }
+  | { type: 'ACTION_PENDING'; requestId: string; action: string }
+  | { type: 'ACTION_RESULT'; result: ActionFeedback }
   | { type: 'ERROR'; error: string }
   | { type: 'CLOSE' }
 
@@ -35,11 +39,29 @@ function reducer(state: ConnectionState, action: Action): ConnectionState {
         error: undefined,
       }
 
+    case 'ACTION_PENDING':
+      return {
+        ...state,
+        pendingActions: { ...state.pendingActions, [action.requestId]: action.action },
+        actionFeedback: undefined,
+      }
+
+    case 'ACTION_RESULT': {
+      const pendingActions = { ...state.pendingActions }
+      if (action.result.requestId) delete pendingActions[action.result.requestId]
+      return { ...state, pendingActions, actionFeedback: action.result }
+    }
+
     case 'ERROR':
       return { ...state, error: action.error }
 
     case 'CLOSE':
-      return { ...state, status: 'disconnected', error: 'connection lost' }
+      return {
+        ...state,
+        status: 'disconnected',
+        error: 'connection lost',
+        pendingActions: {},
+      }
 
     default:
       return state
@@ -49,6 +71,7 @@ function reducer(state: ConnectionState, action: Action): ConnectionState {
 const INIT: ConnectionState = {
   status: 'connecting',
   snapshot: emptySnapshot(),
+  pendingActions: {},
 }
 
 const RECONNECT_MS = 2000
@@ -63,6 +86,8 @@ const MAX_ATTEMPTS = 20
 export function useGameState(): ConnectionState & { runAction: RunAction; runControl: RunControl } {
   const [state, dispatch] = useReducer(reducer, INIT)
   const wsRef = useRef<WebSocket | null>(null)
+  const pendingRef = useRef(new Map<string, string>())
+  const requestCounter = useRef(0)
 
   const connect = useCallback((attempt: number) => {
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
@@ -80,6 +105,15 @@ export function useGameState(): ConnectionState & { runAction: RunAction; runCon
       } catch {
         return
       }
+      if (isLegacyActionResult(msg)) {
+        const pending = pendingRef.current.entries().next().value as [string, string] | undefined
+        if (!pending) return
+        const [requestId, action] = pending
+        pendingRef.current.delete(requestId)
+        dispatch({ type: 'ACTION_RESULT', result: toFeedback(msg, requestId, action) })
+        return
+      }
+
       switch (msg.type) {
         case 'hello':
           dispatch({ type: 'HELLO' })
@@ -87,6 +121,14 @@ export function useGameState(): ConnectionState & { runAction: RunAction; runCon
         case 'snapshot':
           dispatch({ type: 'SNAPSHOT', snapshot: msg })
           break
+        case 'action_result': {
+          const pending = resolvePending(pendingRef.current, msg)
+          dispatch({
+            type: 'ACTION_RESULT',
+            result: toFeedback(msg, pending?.[0] ?? msg.requestId, pending?.[1] ?? msg.action),
+          })
+          break
+        }
       }
     }
 
@@ -96,6 +138,7 @@ export function useGameState(): ConnectionState & { runAction: RunAction; runCon
 
     ws.onclose = () => {
       if (wsRef.current === ws) wsRef.current = null
+      pendingRef.current.clear()
       dispatch({ type: 'CLOSE' })
       // Auto-reconnect with capped back-off
       const delay = Math.min(RECONNECT_MS * (attempt + 1), 10000)
@@ -116,9 +159,19 @@ export function useGameState(): ConnectionState & { runAction: RunAction; runCon
 
   const runAction = useCallback<RunAction>((action, payload) => {
     const ws = wsRef.current
-    if (!ws || ws.readyState !== WebSocket.OPEN) return
-    const msg: ActionMessage = { type: 'action', action, payload: payload ?? {} }
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      dispatch({
+        type: 'ACTION_RESULT',
+        result: { action, ok: false, message: 'Action not sent — backend is offline.' },
+      })
+      return undefined
+    }
+    const requestId = `action-${Date.now()}-${requestCounter.current++}`
+    const msg: ActionMessage = { type: 'action', action, payload: payload ?? {}, requestId }
+    pendingRef.current.set(requestId, action)
+    dispatch({ type: 'ACTION_PENDING', requestId, action })
     ws.send(JSON.stringify(msg))
+    return requestId
   }, [])
 
   const runControl = useCallback<RunControl>((action) => {
@@ -129,4 +182,43 @@ export function useGameState(): ConnectionState & { runAction: RunAction; runCon
   }, [])
 
   return { ...state, runAction, runControl }
+}
+
+type ActionResultLike = Pick<ActionResultMessage, 'ok' | 'message' | 'error' | 'requestId' | 'action'>
+
+function isLegacyActionResult(message: unknown): message is ActionResultLike & { type?: undefined } {
+  if (!message || typeof message !== 'object') return false
+  const candidate = message as Record<string, unknown>
+  return candidate.type === undefined && typeof candidate.ok === 'boolean'
+}
+
+function resolvePending(
+  pending: Map<string, string>,
+  result: ActionResultMessage,
+): [string, string] | undefined {
+  if (result.requestId && pending.has(result.requestId)) {
+    const action = pending.get(result.requestId)!
+    pending.delete(result.requestId)
+    return [result.requestId, action]
+  }
+  if (result.requestId) return undefined
+  const first = pending.entries().next().value as [string, string] | undefined
+  if (first) pending.delete(first[0])
+  return first
+}
+
+function toFeedback(
+  result: ActionResultLike,
+  requestId?: string,
+  action?: string,
+): ActionFeedback {
+  const actionLabel = action?.replace(/_/g, ' ')
+  return {
+    requestId,
+    action,
+    ok: result.ok,
+    message: result.message ?? result.error ?? (result.ok
+      ? `${actionLabel ?? 'Action'} applied.`
+      : `${actionLabel ?? 'Action'} failed.`),
+  }
 }

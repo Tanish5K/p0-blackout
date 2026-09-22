@@ -10,6 +10,7 @@ import type {
   QueueSnapshot,
   PoolSnapshot,
   MetricsSnapshot,
+  MetricsDelta,
   BackendEvent,
   ServiceStatus,
 } from '../types/game'
@@ -32,15 +33,7 @@ export function emptySnapshot(): MergedSnapshot {
     services: [],
     queues: [],
     pools: [],
-    metrics: {
-      systemHealth: 0,
-      successRate: 0,
-      latencyMs: { p50: 0, p99: 0 },
-      latencyStale: false,
-      successStale: false,
-      latencyAgeMs: 0,
-      successAgeMs: 0,
-    },
+    metrics: emptyMetrics(),
     objectives: [],
     events: [],
   }
@@ -105,7 +98,7 @@ function freshRun(prev: MergedSnapshot, update: SnapshotMessage): MergedSnapshot
     services: update.services ?? prev.services,
     queues: update.queues ?? prev.queues,
     pools: update.pools ?? prev.pools,
-    metrics: mergeMetrics(prev.metrics, update.metrics),
+    metrics: mergeMetrics(emptyMetrics(), update.metrics),
     objectives: update.objectives ?? [],
     outcome: update.outcome ?? undefined,
     events: mergeEvents([], update.events ?? []),
@@ -114,19 +107,16 @@ function freshRun(prev: MergedSnapshot, update: SnapshotMessage): MergedSnapshot
 
 function mergeMetrics(
   prev: MetricsSnapshot,
-  next: MetricsSnapshot | undefined,
+  next: MetricsDelta | undefined,
 ): MetricsSnapshot {
-  if (!next || (!next.systemHealth && !next.successRate && !next.latencyMs.p50 && !next.latencyMs.p99)) {
-    return prev
-  }
-  // Stale flags/ages use `??` (not truthiness): a false/0 from the backend is
-  // a real "fresh now" signal and must not be swallowed by a latched true.
+  if (!next) return prev
+
   return {
-    systemHealth: next.systemHealth || prev.systemHealth,
-    successRate: next.successRate || prev.successRate,
+    systemHealth: next.systemHealth ?? prev.systemHealth,
+    successRate: next.successRate ?? prev.successRate,
     latencyMs: {
-      p50: next.latencyMs.p50 || prev.latencyMs.p50,
-      p99: next.latencyMs.p99 || prev.latencyMs.p99,
+      p50: next.latencyMs?.p50 ?? prev.latencyMs.p50,
+      p99: next.latencyMs?.p99 ?? prev.latencyMs.p99,
     },
     latencyStale: next.latencyStale ?? prev.latencyStale,
     successStale: next.successStale ?? prev.successStale,
@@ -135,16 +125,38 @@ function mergeMetrics(
   }
 }
 
+function emptyMetrics(): MetricsSnapshot {
+  return {
+    systemHealth: 0,
+    successRate: 0,
+    latencyMs: { p50: 0, p99: 0 },
+    latencyStale: false,
+    successStale: false,
+    latencyAgeMs: 0,
+    successAgeMs: 0,
+  }
+}
+
 const MAX_EVENTS = 400
 
 function mergeEvents(prev: BackendEvent[], incoming: BackendEvent[]): BackendEvent[] {
   if (incoming.length === 0) return prev
-  // Events are strictly per-tick and ticks are monotonic: only append events
-  // newer than the last tick we've seen. A re-delivered tick is ignored.
-  const lastTick = prev.length > 0 ? prev[prev.length - 1].tick : -1
-  const fresh = incoming.filter((e) => e.tick > lastTick)
+  // Sequence is authoritative and permits multiple events in the same tick.
+  // The compound fallback keeps compatibility with older servers without seq.
+  const seen = new Set(prev.map(eventKey))
+  const fresh = incoming.filter((event) => {
+    const key = eventKey(event)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
   const next = fresh.length > 0 ? prev.concat(fresh) : prev
   return next.length > MAX_EVENTS ? next.slice(next.length - MAX_EVENTS) : next
+}
+
+function eventKey(event: BackendEvent): string {
+  if (event.seq !== undefined) return `seq:${event.seq}`
+  return [event.tick, event.time, event.type, event.subject, event.value ?? '', event.data ?? ''].join('|')
 }
 
 /* ── Linear interpolation between two merged snapshots ─────────────── */
