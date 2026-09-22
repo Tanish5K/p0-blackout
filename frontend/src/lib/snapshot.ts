@@ -23,10 +23,24 @@ export function emptySnapshot(): MergedSnapshot {
     phase: 'idle',
     runId: 0,
     runStatus: 'idle',
+    incidentNumber: 1,
+    incidentName: '',
+    incidentDesc: '',
+    budget: 0,
+    budgetMax: 0,
+    campaignTotal: 1,
     services: [],
     queues: [],
     pools: [],
-    metrics: { systemHealth: 0, successRate: 0, latencyMs: { p50: 0, p99: 0 } },
+    metrics: {
+      systemHealth: 0,
+      successRate: 0,
+      latencyMs: { p50: 0, p99: 0 },
+      latencyStale: false,
+      successStale: false,
+      latencyAgeMs: 0,
+      successAgeMs: 0,
+    },
     objectives: [],
     events: [],
   }
@@ -55,6 +69,12 @@ export function mergeSnapshot(prev: MergedSnapshot, update: SnapshotMessage): Me
     phase: update.phase,
     runId: update.runId ?? prev.runId,
     runStatus: update.runStatus ?? prev.runStatus,
+    incidentNumber: update.incidentNumber ?? prev.incidentNumber,
+    incidentName: update.incidentName ?? prev.incidentName,
+    incidentDesc: update.incidentDesc ?? prev.incidentDesc,
+    budget: update.budget ?? prev.budget,
+    budgetMax: update.budgetMax ?? prev.budgetMax,
+    campaignTotal: update.campaignTotal ?? prev.campaignTotal,
     services: update.services ?? prev.services,
     queues: update.queues ?? prev.queues,
     pools: update.pools ?? prev.pools,
@@ -76,6 +96,12 @@ function freshRun(prev: MergedSnapshot, update: SnapshotMessage): MergedSnapshot
     phase: update.phase,
     runId: update.runId ?? prev.runId + 1,
     runStatus: update.runStatus ?? prev.runStatus,
+    incidentNumber: update.incidentNumber ?? prev.incidentNumber,
+    incidentName: update.incidentName ?? prev.incidentName,
+    incidentDesc: update.incidentDesc ?? prev.incidentDesc,
+    budget: update.budget ?? prev.budget,
+    budgetMax: update.budgetMax ?? prev.budgetMax,
+    campaignTotal: update.campaignTotal ?? prev.campaignTotal,
     services: update.services ?? prev.services,
     queues: update.queues ?? prev.queues,
     pools: update.pools ?? prev.pools,
@@ -93,6 +119,8 @@ function mergeMetrics(
   if (!next || (!next.systemHealth && !next.successRate && !next.latencyMs.p50 && !next.latencyMs.p99)) {
     return prev
   }
+  // Stale flags/ages use `??` (not truthiness): a false/0 from the backend is
+  // a real "fresh now" signal and must not be swallowed by a latched true.
   return {
     systemHealth: next.systemHealth || prev.systemHealth,
     successRate: next.successRate || prev.successRate,
@@ -100,6 +128,10 @@ function mergeMetrics(
       p50: next.latencyMs.p50 || prev.latencyMs.p50,
       p99: next.latencyMs.p99 || prev.latencyMs.p99,
     },
+    latencyStale: next.latencyStale ?? prev.latencyStale,
+    successStale: next.successStale ?? prev.successStale,
+    latencyAgeMs: next.latencyAgeMs ?? prev.latencyAgeMs,
+    successAgeMs: next.successAgeMs ?? prev.successAgeMs,
   }
 }
 
@@ -130,6 +162,12 @@ export function lerpSnapshot(
   const phase = b.phase
   const runId = b.runId
   const runStatus = b.runStatus
+  const incidentNumber = b.incidentNumber
+  const incidentName = b.incidentName
+  const incidentDesc = b.incidentDesc
+  const budget = b.budget
+  const budgetMax = b.budgetMax
+  const campaignTotal = b.campaignTotal
 
   // Arrays: lerp in-place, fall back to a if b doesn't carry it
   const services = lerpServices(a.services, b.services, c)
@@ -140,7 +178,7 @@ export function lerpSnapshot(
   const outcome = b.outcome
   const events = b.events // always latest events (never interpolated)
 
-  return { tick, clock, phase, runId, runStatus, services, queues, pools, metrics, objectives, outcome, events }
+  return { tick, clock, phase, runId, runStatus, incidentNumber, incidentName, incidentDesc, budget, budgetMax, campaignTotal, services, queues, pools, metrics, objectives, outcome, events }
 }
 
 function lerpServices(
@@ -160,6 +198,7 @@ function lerpServices(
       health: lerp(sa.health, sb.health, t),
       status: t >= 0.5 ? sb.status : sa.status,
       wired: t >= 0.5 ? sb.wired : sa.wired,
+      stalled: t >= 0.5 ? sb.stalled : sa.stalled,
       synchronous: t >= 0.5 ? sb.synchronous : sa.synchronous,
     })
   }
@@ -173,6 +212,7 @@ const STUB_SERVICE: ServiceSnapshot = {
   health: 100,
   status: 'idle',
   wired: false,
+  stalled: false,
   synchronous: false,
 }
 
@@ -220,12 +260,14 @@ function lerpPools(
     out.push({
       queue: pb.queue || pa.queue,
       workers: t >= 0.5 ? pb.workers : pa.workers, // snap (discrete)
+      ackPolicy: t >= 0.5 ? pb.ackPolicy : pa.ackPolicy, // snap (enum)
+      live: t >= 0.5 ? pb.live : pa.live, // snap (slot view)
     })
   }
   return out
 }
 
-const STUB_POOL: PoolSnapshot = { queue: '', workers: 0 }
+const STUB_POOL: PoolSnapshot = { queue: '', workers: 0, ackPolicy: '', live: [] }
 
 function lerpMetrics(a: MetricsSnapshot, b: MetricsSnapshot, t: number): MetricsSnapshot {
   return {
@@ -235,6 +277,12 @@ function lerpMetrics(a: MetricsSnapshot, b: MetricsSnapshot, t: number): Metrics
       p50: lerp(a.latencyMs.p50, b.latencyMs.p50, t),
       p99: lerp(a.latencyMs.p99, b.latencyMs.p99, t),
     },
+    // Stale flags/ages are booleans and point-in-time stamps: snap to b rather
+    // than interpolating (a mid-transition stale flip would be meaningless).
+    latencyStale: b.latencyStale,
+    successStale: b.successStale,
+    latencyAgeMs: b.latencyAgeMs,
+    successAgeMs: b.successAgeMs,
   }
 }
 
@@ -273,6 +321,14 @@ export function formatRate(v: number): string {
   return `${Math.round(v)}`
 }
 
+/** Format a millisecond age as "12s ago" / "2m ago" (empty for "never"). */
+export function formatAgo(ms: number): string {
+  if (!ms || ms < 0) return ''
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s ago`
+  return `${Math.floor(s / 60)}m ${s % 60}s ago`
+}
+
 export function formatDepth(v: number): string {
   if (v >= 10000) return `${(v / 1000).toFixed(0)}k`
   if (v >= 1000) return `${(v / 1000).toFixed(1)}k`
@@ -284,6 +340,7 @@ export function formatDepth(v: number): string {
 const SERVICE_QUEUE_MAP: Record<string, string> = {
   orders: 'orders.work',
   payments: 'payments.work',
+  identity: 'identity.worker',
   analytics: 'analytics.events',
 }
 

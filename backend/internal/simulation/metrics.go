@@ -2,6 +2,7 @@ package simulation
 
 import (
 	"math"
+	"strings"
 	"time"
 )
 
@@ -94,16 +95,29 @@ func deriveMetrics(s *GameState) {
 	// mode the gateway returns immediately and the cost of the surge shows up
 	// as backlog/depth on the queues instead of latency.
 	var p50, p99 time.Duration
+	latencyStale := false
+	latencyAgeMs := 0.0
 	if ordersSync(s) {
 		if s.Sim != nil && s.Sim.Gateway != nil {
 			p50 = s.Sim.Gateway.Percentile(50)
 			p99 = s.Sim.Gateway.Percentile(99)
 		}
-		if p50 == 0 {
+		// A paused orders pool stops acks, the sampler's 10s window empties and
+		// Percentile returns 0. Without this flag the p50==0 fallback below
+		// would fabricate an 8ms "calm baseline" and the rail would report a
+		// healthy latency right next to a real failure. Stale wins: the value
+		// surfaces as 0 and the frontend renders "—", not a lie.
+		latencyStale = s.Sim != nil && s.Sim.Gateway != nil && s.Sim.Gateway.Count() == 0
+		if p50 == 0 && !latencyStale {
 			p50 = 8 * time.Millisecond // calm baseline before any samples
 		}
 		if p99 == 0 {
 			p99 = p50
+		}
+		if s.Sim != nil {
+			if last := s.Sim.LastCompletion("orders.work"); !last.IsZero() {
+				latencyAgeMs = float64(time.Since(last).Milliseconds())
+			}
 		}
 	} else {
 		p50 = 1500 * time.Microsecond // ~1.5ms fast-path
@@ -113,6 +127,8 @@ func deriveMetrics(s *GameState) {
 	// --- 4. Customer success: real acks / (acks + failures), weighted over
 	// the queues carrying the order flow. --------------------------------
 	success := 1.0
+	successStale := false
+	successAgeMs := 0.0
 	if s.Sim != nil {
 		var ack, fail int64
 		for _, snap := range s.Sim.Snapshots() {
@@ -121,6 +137,37 @@ func deriveMetrics(s *GameState) {
 		}
 		if ack+fail > 0 {
 			success = float64(ack) / float64(ack+fail)
+		}
+		// Success is cumulative (all-time), so once completions stop it freezes
+		// at the last ratio and reads "100% — fine" next to a real failure.
+		// The stale flag is what makes the freeze legible as history, not a
+		// live reading. Numeric stays cumulative: the Customer Success ≥ 70%
+		// objective math is untouched.
+		if newest := s.Sim.NewestCompletion(); !newest.IsZero() {
+			if age := time.Since(newest); age >= sampleWindow {
+				successStale = true
+				successAgeMs = float64(age.Milliseconds())
+			}
+		} else {
+			successStale = true
+		}
+	}
+
+	// --- 4b. Paused-pressure ("stalled") flags, per service. ----------
+	// A service whose queue receives messages but has no consumers draining it
+	// (paused pool, backlog climbing) needs its own flag: the rail's
+	// latency/success can't show it, either because they're real-and-green for
+	// the services still working, or fabricated-stale for everything-paused.
+	// "Messages entering, nobody consuming" is the honest signature — rates are
+	// refreshed at 1s cadence by applyRates on GameState.Queues.
+	for i := range s.Services {
+		sv := &s.Services[i]
+		for j := range s.Queues {
+			if serviceForQueue(s.Queues[j].Name) != sv.ID {
+				continue
+			}
+			sv.Stalled = !sv.Wired && s.Queues[j].RateIn > 0 && s.Queues[j].RateOut == 0
+			break
 		}
 	}
 
@@ -157,6 +204,19 @@ func deriveMetrics(s *GameState) {
 	s.Metrics.LatencyP99 = p99
 	s.Metrics.SuccessRate = success
 	s.Metrics.SystemHealth = health
+	s.Metrics.LatencyStale = latencyStale
+	s.Metrics.SuccessStale = successStale
+	s.Metrics.LatencyAgeMs = latencyAgeMs
+	s.Metrics.SuccessAgeMs = successAgeMs
+}
+
+// serviceForQueue maps a queue name back to its backing service ("orders.work"
+// → "orders"); names without a domain separator are returned as-is.
+func serviceForQueue(name string) string {
+	if i := strings.IndexByte(name, '.'); i >= 0 {
+		return name[:i]
+	}
+	return name
 }
 
 // ordersSync reports whether the orders service runs its synchronous path.

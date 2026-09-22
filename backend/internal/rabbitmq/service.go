@@ -77,6 +77,17 @@ func AllServices() *Registry {
 		},
 		Service{
 			ID: "identity", Name: "Identity", Critical: true, Wired: false, WiredIn: 2,
+			Topology: Topology{
+				Exchanges: []Exchange{
+					{Name: "identity.events", Type: ExchangeDirect, Durable: true},
+				},
+				Queues: []Queue{
+					{Name: "identity.worker", Durable: true},
+				},
+				Bindings: []Binding{
+					{Queue: "identity.worker", Exchange: "identity.events", RoutingKey: "identity.requests"},
+				},
+			},
 		},
 		Service{
 			ID: "notifications", Name: "Notifications", Critical: false, Wired: false, WiredIn: 3,

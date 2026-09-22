@@ -102,8 +102,10 @@ func main() {
 	// trip lands in Runtime.Gateway: the customer-visible latency the simulation
 	// reads in sync mode. The age is computed against the sent-at stamp the
 	// generator embeds in each body, so queue wait + processing are both real.
+	// Incident 2's synchronous identity share mixes into the same sampler, so
+	// the customer-visible latency honestly reflects whichever leg is hurting.
 	handler := func(ctx context.Context, queue string, d rabbitmq.Delivery) error {
-		if queue == "orders.work" {
+		if queue == "orders.work" || queue == "identity.worker" {
 			if t, ok := sentAtMillis(d.Body); ok {
 				rt.Gateway.Record(time.Since(t))
 			}

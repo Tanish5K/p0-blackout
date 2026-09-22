@@ -1,6 +1,7 @@
 package simulation
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -34,6 +35,16 @@ func Tick(s *GameState, dt time.Duration) []events.Event {
 	payIn := int64(float64(reqs) * payFrac)
 	s.Traffic.OrderMessagesThisTick = reqs
 	s.Traffic.PayMessagesThisTick = payIn
+	s.Traffic.IdentityMessagesThisTick = 0
+	var idIn int64
+	// Incident 2 rides the same surge curve but adds a synchronous identity
+	// hop: a share of inbound requests must also pass identity.worker before
+	// the gateway can complete. The share is modest so identity reads as
+	// pressure-amplifier, not the whole story (the crash storm is the point).
+	if s.IncludeIdentity {
+		idIn = int64(float64(reqs) * IdentityShare)
+		s.Traffic.IdentityMessagesThisTick = idIn
+	}
 
 	if reqs > 0 {
 		evs = append(evs, events.Event{
@@ -51,6 +62,12 @@ func Tick(s *GameState, dt time.Duration) []events.Event {
 			Value: float64(payIn), Data: "payments.work",
 		})
 	}
+	if idIn > 0 {
+		evs = append(evs, events.Event{
+			Tick: s.Tick, Time: s.Elapsed, Type: "route", Subject: "identity.events",
+			Value: float64(idIn), Data: "identity.worker",
+		})
+	}
 
 	// --- 3. Derived metrics from the real QueueState + worker telemetry. ------
 	deriveMetrics(s)
@@ -58,7 +75,11 @@ func Tick(s *GameState, dt time.Duration) []events.Event {
 	// Emit a metric event every N ticks so the terminal shows a moving rail.
 	// Data carries the health reading so the postmortem timeline can reconstruct
 	// when System Health crossed its floors.
+	//
+	// Emitted BEFORE the metric event so a timeline walk that fires a threshold
+	// crossing on a metric event has already seen the same tick's services.
 	if s.Tick%10 == 0 {
+		evs = append(evs, stateEvent(s))
 		evs = append(evs, events.Event{
 			Tick: s.Tick, Time: s.Elapsed, Type: "metric", Subject: "rail",
 			Value: s.Metrics.LatencyP99.Seconds() * 1000,
@@ -67,6 +88,63 @@ func Tick(s *GameState, dt time.Duration) []events.Event {
 	}
 
 	return evs
+}
+
+// ServiceStateReport is the per-service view broadcast in a "state" event.
+// The timeline uses it to say which service was worst at a health crossing and
+// why ("paused, depth 4,200, nothing consuming") instead of a bare percentage.
+type ServiceStateReport struct {
+	ID      string  `json:"id"`
+	Load    float64 `json:"load"`
+	Health  float64 `json:"health"`
+	Depth   int64   `json:"depth"`
+	Wired   bool    `json:"wired"`
+	RateIn  float64 `json:"rateIn"`
+	RateOut float64 `json:"rateOut"`
+}
+
+// ParseServiceState decodes a "state" event's JSON Data into its per-service
+// reports. Returns ok=false for anything that isn't a state event.
+func ParseServiceState(data string) ([]ServiceStateReport, bool) {
+	var m struct {
+		Services []ServiceStateReport `json:"services"`
+	}
+	if err := json.Unmarshal([]byte(data), &m); err != nil {
+		return nil, false
+	}
+	return m.Services, true
+}
+
+// stateEvent snapshots every service's live state into a JSON "state" event.
+func stateEvent(s *GameState) events.Event {
+	reports := make([]ServiceStateReport, 0, len(s.Services))
+	for i := range s.Services {
+		sv := &s.Services[i]
+		report := ServiceStateReport{
+			ID:     sv.ID,
+			Load:   sv.Load,
+			Health: sv.Health,
+			Wired:  sv.Wired,
+		}
+		for j := range s.Queues {
+			if serviceForQueue(s.Queues[j].Name) != sv.ID {
+				continue
+			}
+			report.Depth = s.Queues[j].Depth
+			report.RateIn = s.Queues[j].RateIn
+			report.RateOut = s.Queues[j].RateOut
+			break
+		}
+		reports = append(reports, report)
+	}
+	data, _ := json.Marshal(struct {
+		Services []ServiceStateReport `json:"services"`
+	}{Services: reports})
+	return events.Event{
+		Tick: s.Tick, Time: s.Elapsed, Type: "state", Subject: "system",
+		Value: s.Metrics.SystemHealth,
+		Data:  string(data),
+	}
 }
 
 // resetTrafficRate recomputes the current generation rate from the profile and

@@ -2,6 +2,10 @@ package simulation
 
 import "time"
 
+// IdentityShare is the fraction of inbound requests that also pass through the
+// synchronous Identity hop in Incident 2 (0 when Identity is not wired).
+const IdentityShare = 0.30
+
 // WindowSize is how many ticks each rolling rate window holds. Rates are
 // reported as averages over this window rather than instantaneous per-tick
 // counts, so downstream UIs won't flicker.

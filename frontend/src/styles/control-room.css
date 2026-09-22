@@ -131,6 +131,22 @@ body {
 .rail-metric.warn     .metric-value { color: var(--warn); }
 .rail-metric.danger   .metric-value { color: var(--danger); }
 
+/* Stale metrics (no fresh samples — paused/everything-paused runs): grayed
+   with an age suffix so "—" reads as intent, not a broken number. */
+.metric-stale {
+  opacity: 0.45;
+}
+.rail-metric.metric-stale .metric-value {
+  color: var(--faint);
+}
+.metric-age {
+  font-style: normal;
+  font-size: 11px;
+  color: var(--faint);
+  opacity: 0.8;
+  margin-left: 2px;
+}
+
 .pill {
   padding: 4px 12px;
   border-radius: 999px;
@@ -511,6 +527,55 @@ body {
 .mode-chip.sync  { color: var(--warn);  border: 1px solid var(--warn); }
 .mode-chip.async { color: var(--ok);    border: 1px solid var(--ok); }
 
+/* ── Worker slot view + ack mode + budget rows (Incident 2) ─────────── */
+
+.worker-slots {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+}
+.worker-slot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 4px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--ok);
+}
+.worker-slot.down {
+  color: var(--danger);
+  border-style: dashed;
+  background: rgba(255, 82, 82, 0.08);
+}
+.worker-slots .mgmt-btn { margin-left: 6px; }
+
+.failover-row {
+  align-items: center;
+}
+.budget-pips {
+  display: inline-flex;
+  gap: 4px;
+  margin-right: 6px;
+}
+.budget-pip {
+  width: 10px;
+  height: 18px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: rgba(255, 183, 77, 0.25);
+}
+.budget-pip.spent {
+  background: transparent;
+  border-color: var(--line-dim);
+}
+
+.pill.budget { color: var(--warn); border-color: var(--warn); }
+.pill.budget.empty { color: var(--danger); border-color: var(--danger); }
+
 .control-hint {
   margin: 8px 0 0;
   font-size: 12px;
@@ -664,6 +729,91 @@ body {
 .start-brief p { margin: 0 0 10px; font-size: 13px; line-height: 1.7; color: var(--text); }
 .start-brief ul { margin: 0; padding-left: 18px; font-size: 12.5px; line-height: 1.8; color: var(--muted); }
 .start-brief li::marker { color: var(--cyan); }
+
+/* ── Home / campaign view ─────────────────────────────────────────── */
+
+.home-card { width: min(720px, 94vw); }
+
+.campaign-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0 0 18px;
+  text-align: left;
+}
+.campaign-card {
+  border: 1px solid var(--line-dim);
+  border-left: 3px solid var(--line);
+  background: var(--surface);
+  border-radius: 6px;
+  padding: 12px 16px;
+  opacity: 0.85;
+}
+.campaign-card.next {
+  border-left-color: var(--cyan);
+  opacity: 1;
+  background: var(--surface-2);
+}
+.campaign-card.cleared { border-left-color: var(--ok); }
+.campaign-card.locked { border-left-color: var(--line); }
+
+.incident-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.incident-number {
+  font-size: 11px;
+  letter-spacing: 2px;
+  color: var(--faint);
+}
+.incident-name {
+  font-size: 14px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text);
+}
+.incident-status {
+  margin-left: auto;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+}
+.incident-status.cleared { color: var(--ok); }
+.incident-status.next    { color: var(--cyan); }
+.incident-status.locked  { color: var(--faint); }
+
+.incident-desc {
+  margin: 0 0 8px;
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--muted);
+}
+.incident-objectives {
+  margin: 0;
+  padding: 8px 0 0 16px;
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--muted);
+  border-top: 1px solid var(--line-dim);
+}
+.incident-objectives li::marker { color: var(--cyan); }
+.incident-objectives .obj {
+  font-family: var(--mono);
+  color: var(--text);
+}
+.incident-objectives .obj.fail { color: var(--warn); }
+.incident-objectives .obj.survive { color: var(--cyan); }
+
+.home-hint {
+  margin: 0 0 18px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--faint);
+}
 
 .start-button {
   font-family: inherit;

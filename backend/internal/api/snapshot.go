@@ -25,6 +25,18 @@ type Snapshot struct {
 	Queues   []QueueSnapshot   `json:"queues"`
 	Pools    []PoolSnapshot    `json:"pools"`
 	Metrics  MetricsSnapshot   `json:"metrics"`
+	// Incident identifies the live scenario and its emergency budget. The
+	// budget is Incident 2's failover allowance (spending it shows here); it
+	// is always included so the client can render "2/2" without merge tricks.
+	IncidentNumber int    `json:"incidentNumber"`
+	IncidentName   string `json:"incidentName"`
+	IncidentDesc   string `json:"incidentDesc"`
+	Budget         int    `json:"budget"`
+	BudgetMax      int    `json:"budgetMax"`
+	// CampaignTotal is how many incidents the campaign holds (the frontend maps
+	// incidentNumber → "retry" when failed, "continue to Incident N+1" after a
+	// survive, "campaign complete" on the last).
+	CampaignTotal int `json:"campaignTotal"`
 	// Objectives is the live objective strip (fail floors + survive clock).
 	Objectives []ObjectiveSnapshot `json:"objectives"`
 	// Outcome appears once the run ends: terminal verdict for the postmortem.
@@ -44,6 +56,9 @@ type ServiceSnapshot struct {
 	// Wired mirrors the registry's live-MQ flag: paused services read false so
 	// the frontend can show pause/resume control state.
 	Wired bool `json:"wired"`
+	// Stalled flags a paused service whose queue is filling with nobody
+	// consuming — the failure signature the rail's latency/success can't see.
+	Stalled bool `json:"stalled"`
 	// Synchronous reflects the orders path's processing mode; only wired
 	// services toggle it, stubs always report false.
 	Synchronous bool `json:"synchronous"`
@@ -66,7 +81,14 @@ type OutcomeSnapshot struct {
 	Success   float64  `json:"success"`
 	P50Ms     float64  `json:"p50Ms"`
 	P99Ms     float64  `json:"p99Ms"`
-	Timeline  []string `json:"timeline"`
+	// LatencyStale/SuccessStale flag terminal metrics computed with no fresh
+	// completions in the sample window (e.g. pause-everything): the postmortem
+	// renders those as grayed "—" instead of reporting 8ms / 100% as current.
+	LatencyStale bool    `json:"latencyStale"`
+	SuccessStale bool    `json:"successStale"`
+	LatencyAgeMs float64 `json:"latencyAgeMs"`
+	SuccessAgeMs float64 `json:"successAgeMs"`
+	Timeline     []string `json:"timeline"`
 }
 
 type QueueSnapshot struct {
@@ -81,12 +103,24 @@ type QueueSnapshot struct {
 type PoolSnapshot struct {
 	Queue   string `json:"queue"`
 	Workers int    `json:"workers"`
+	// AckPolicy is the pool's current acknowledgement mode ("manual"|"auto").
+	AckPolicy string `json:"ackPolicy"`
+	// Live lists the worker slot ids currently running (one fewer than Workers
+	// while a crashed slot holds). Static unless something crashes.
+	Live []int `json:"live"`
 }
 
 type MetricsSnapshot struct {
 	SystemHealth float64   `json:"systemHealth"`
 	SuccessRate  float64   `json:"successRate"`
 	LatencyMs    LatencyMs `json:"latencyMs"`
+	// Stale flags + ages tell the frontend which rail numbers to gray out as
+	// "no fresh samples" instead of showing frozen/fabricated readings. See
+	// simulation.Metrics.
+	LatencyStale  bool    `json:"latencyStale"`
+	SuccessStale  bool    `json:"successStale"`
+	LatencyAgeMs  float64 `json:"latencyAgeMs"`
+	SuccessAgeMs  float64 `json:"successAgeMs"`
 }
 
 type LatencyMs struct {
@@ -128,15 +162,15 @@ func SnapshotFromState(s *simulation.GameState, ended bool) Snapshot {
 			Health:      sv.Health,
 			Status:      string(sv.Status),
 			Wired:       sv.Wired,
+			Stalled:     sv.Stalled,
 			Synchronous: sv.Synchronous,
 		}
 	}
 
-	// §5.2 stub nodes: Identity, Notifications and Audit are visible on the
-	// map from run one but have no wired topology until their incident. They
-	// report a static idle state so the frontend renders them without needing
-	// a client-side registry.
-	snap.Services = append(snap.Services, stubServiceSnapshots()...)
+	// §5.2 stub nodes: Notifications and Audit are visible on the map from run
+	// one but have no wired topology until their incident. Identity stops being
+	// a stub the moment its incident wires it (then it lives in s.Services).
+	snap.Services = append(snap.Services, stubServiceSnapshots(s.Services)...)
 
 	snap.Queues = make([]QueueSnapshot, len(s.Queues))
 	for i, q := range s.Queues {
@@ -155,8 +189,15 @@ func SnapshotFromState(s *simulation.GameState, ended bool) Snapshot {
 		snap.Pools[i] = PoolSnapshot{
 			Queue:   p.Queue,
 			Workers: p.Workers,
+			Live:    workerIDs(p.WorkerDetail),
 		}
 	}
+
+	snap.IncidentNumber = s.IncidentNumber
+	snap.IncidentName = s.IncidentName
+	snap.IncidentDesc = s.IncidentDesc
+	snap.Budget = s.Budget
+	snap.BudgetMax = s.BudgetMax
 
 	if s.Objectives != nil {
 		snap.Objectives = make([]ObjectiveSnapshot, 0, 3)
@@ -175,20 +216,28 @@ func SnapshotFromState(s *simulation.GameState, ended bool) Snapshot {
 	if s.Outcome != nil {
 		m := s.Outcome.FinalMetrics
 		snap.Outcome = &OutcomeSnapshot{
-			Failed:    s.Outcome.Failed,
-			Reason:    s.Outcome.FailReason,
-			EndedAtMs: s.Outcome.EndedAt.Milliseconds(),
-			Health:    m.SystemHealth,
-			Success:   m.SuccessRate,
-			P50Ms:     float64(m.LatencyP50.Microseconds()) / 1000.0,
-			P99Ms:     float64(m.LatencyP99.Microseconds()) / 1000.0,
-			Timeline:  s.Timeline,
+			Failed:       s.Outcome.Failed,
+			Reason:       s.Outcome.FailReason,
+			EndedAtMs:    s.Outcome.EndedAt.Milliseconds(),
+			Health:       m.SystemHealth,
+			Success:      m.SuccessRate,
+			P50Ms:        float64(m.LatencyP50.Microseconds()) / 1000.0,
+			P99Ms:        float64(m.LatencyP99.Microseconds()) / 1000.0,
+			LatencyStale: m.LatencyStale,
+			SuccessStale: m.SuccessStale,
+			LatencyAgeMs: m.LatencyAgeMs,
+			SuccessAgeMs: m.SuccessAgeMs,
+			Timeline:     s.Timeline,
 		}
 	}
 
 	snap.Metrics = MetricsSnapshot{
-		SystemHealth: s.Metrics.SystemHealth,
-		SuccessRate:  s.Metrics.SuccessRate,
+		SystemHealth:  s.Metrics.SystemHealth,
+		SuccessRate:   s.Metrics.SuccessRate,
+		LatencyStale:  s.Metrics.LatencyStale,
+		SuccessStale:  s.Metrics.SuccessStale,
+		LatencyAgeMs:  s.Metrics.LatencyAgeMs,
+		SuccessAgeMs:  s.Metrics.SuccessAgeMs,
 		LatencyMs: LatencyMs{
 			P50: float64(s.Metrics.LatencyP50.Microseconds()) / 1000.0,
 			P99: float64(s.Metrics.LatencyP99.Microseconds()) / 1000.0,
@@ -226,7 +275,11 @@ func Delta(prev, cur *Snapshot) *Snapshot {
 	if prev.Metrics.SystemHealth == cur.Metrics.SystemHealth &&
 		prev.Metrics.SuccessRate == cur.Metrics.SuccessRate &&
 		prev.Metrics.LatencyMs.P50 == cur.Metrics.LatencyMs.P50 &&
-		prev.Metrics.LatencyMs.P99 == cur.Metrics.LatencyMs.P99 {
+		prev.Metrics.LatencyMs.P99 == cur.Metrics.LatencyMs.P99 &&
+		prev.Metrics.LatencyStale == cur.Metrics.LatencyStale &&
+		prev.Metrics.SuccessStale == cur.Metrics.SuccessStale &&
+		prev.Metrics.LatencyAgeMs == cur.Metrics.LatencyAgeMs &&
+		prev.Metrics.SuccessAgeMs == cur.Metrics.SuccessAgeMs {
 		out.Metrics = MetricsSnapshot{}
 	}
 
@@ -240,6 +293,7 @@ func servicesEqual(a, b []ServiceSnapshot) bool {
 	for i := range a {
 		if a[i].Load != b[i].Load || a[i].Health != b[i].Health ||
 			a[i].Status != b[i].Status || a[i].Wired != b[i].Wired ||
+			a[i].Stalled != b[i].Stalled ||
 			a[i].Synchronous != b[i].Synchronous {
 			return false
 		}
@@ -266,7 +320,21 @@ func poolsEqual(a, b []PoolSnapshot) bool {
 		return false
 	}
 	for i := range a {
-		if a[i].Workers != b[i].Workers {
+		if a[i].Workers != b[i].Workers ||
+			a[i].AckPolicy != b[i].AckPolicy ||
+			!intsEqual(a[i].Live, b[i].Live) {
+			return false
+		}
+	}
+	return true
+}
+
+func intsEqual(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
 			return false
 		}
 	}
@@ -286,20 +354,38 @@ func formatElapsed(d interface{ Seconds() float64 }) string {
 	return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
 }
 
-// stubServiceSnapshots returns the 3 idle §5.2 stub services that sit on the
-// map from run one but have no wired topology.
+// stubServiceSnapshots returns the idle §5.2 stub services that sit on the
+// map from run one but have no wired topology. Identity is skipped once its
+// incident wires it (its real ServiceSnapshot comes from s.Services).
 var stubServiceIDs = []string{"identity", "notifications", "audit"}
 
-func stubServiceSnapshots() []ServiceSnapshot {
-	out := make([]ServiceSnapshot, len(stubServiceIDs))
-	for i, id := range stubServiceIDs {
-		out[i] = ServiceSnapshot{
+func stubServiceSnapshots(wired []simulation.ServiceState) []ServiceSnapshot {
+	live := map[string]bool{}
+	for _, sv := range wired {
+		live[sv.ID] = true
+	}
+	out := make([]ServiceSnapshot, 0, len(stubServiceIDs))
+	for _, id := range stubServiceIDs {
+		if live[id] {
+			continue
+		}
+		out = append(out, ServiceSnapshot{
 			ID:     id,
 			Name:   serviceNames[id],
 			Health: 100,
 			Load:   0,
 			Status: "idle",
-		}
+		})
+	}
+	return out
+}
+
+// workerIDs extracts the ordered list of live worker slot ids from a pool's
+// detail rows (a crashed slot drops out; the list stays static otherwise).
+func workerIDs(detail []simulation.WorkerDetail) []int {
+	out := make([]int, 0, len(detail))
+	for _, w := range detail {
+		out = append(out, w.ID)
 	}
 	return out
 }

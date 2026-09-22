@@ -1,6 +1,7 @@
 package simulation
 
 import (
+	"fmt"
 	"os"
 	"sort"
 	"sync"
@@ -8,13 +9,22 @@ import (
 	"time"
 )
 
-// serviceName identifies the three simulated backend services. Each owns a DB,
+// serviceName identifies the simulated backend services. Each owns a DB,
 // and exactly one worker queue pumps work to it.
 const (
 	serviceOrders    = "orders"
 	serviceAnalytics = "analytics"
 	servicePayments  = "payments"
+	serviceIdentity  = "identity"
 )
+
+// RuntimeOpts is the per-run tuning input to (re)build a Runtime: whether the
+// incident scaffolds Identity in (Incident 2), and the campaign DB-fire
+// cascade multiplier inherited from prior incidents' behaviour.
+type RuntimeOpts struct {
+	IncludeIdentity bool
+	FailureMult     float64
+}
 
 // Runtime is the bridge between the simulated backend services (their DBs and
 // per-queue load) and the real broker. The simulation driver feeds it
@@ -31,6 +41,12 @@ type queueState struct {
 	// (published − acked − failed) is a self-contained windowed rate source
 	// that does NOT depend on RabbitMQ's management counter retention.
 	published atomic.Int64
+	// lastCompletion is the wall-clock ms of the most recent ack or failure for
+	// this queue. Zero means nothing has completed since the run started. It
+	// feeds the stale-metric flags: a queue with no completion inside the
+	// sample window has nothing current to report latency/success from, and for
+	// a paused pool that window goes empty every single tick.
+	lastCompletion atomic.Int64
 	// prevPub/prevAck are the previous sample's counters for SnapshotRates' deltas.
 	prevPub int64
 	prevAck int64
@@ -67,56 +83,84 @@ type Runtime struct {
 // a real scenario.
 func NewRuntime() *Runtime {
 	rt := &Runtime{
-		dbs:     newDBPreset(os.Getenv("BLACKOUT_FAST_DB") == "1"),
-		queues:  make(map[string]*queueState),
-		Gateway: NewLatencySampler(),
+		queues: make(map[string]*queueState),
 	}
-	rt.addQueue("orders.work", serviceOrders)
-	rt.addQueue("analytics.events", serviceAnalytics)
-	rt.addQueue("payments.work", servicePayments)
-	rt.order = []string{"orders.work", "analytics.events", "payments.work"}
+	rt.resetLocked(RuntimeOpts{})
 	return rt
 }
 
-// newDBPreset builds the DB set for the given tuning preset. Kept separate from
-// NewRuntime and Runtime.Reset so a new run starts with the exact same DBs and
-// the player never carries tuning across incidents.
-func newDBPreset(fast bool) map[string]*DB {
+// newDBPreset builds the DB set for the given tuning preset, applying the
+// campaign cascade multiplier to every DB. Kept separate from NewRuntime and
+// Runtime.Reset so a new run starts with the exact same DBs and the player
+// never carries tuning across incidents.
+func newDBPreset(fast bool, o RuntimeOpts) map[string]*DB {
+	var m map[string]*DB
 	if fast {
-		return map[string]*DB{
+		m = map[string]*DB{
 			serviceOrders:    NewDB(1.2, 3000, 6), // ~1300/s ceiling -> knee ~40s
 			serviceAnalytics: NewDB(0.8, 4000, 4), // ~1700/s ceiling -> knee ~43s
 			servicePayments:  NewDB(1.8, 1500, 3), // ~620/s ceiling -> knee ~47s
 		}
+	} else {
+		m = map[string]*DB{
+			serviceOrders:    NewDB(0.6, 6000, 6), // ~5-8k/s ceilings: calm at
+			serviceAnalytics: NewDB(0.5, 8000, 4), // 200/s, pressured at the peak
+			servicePayments:  NewDB(0.9, 5000, 5),
+		}
 	}
-	return map[string]*DB{
-		serviceOrders:    NewDB(0.6, 6000, 6), // ~5-8k/s ceilings: calm at
-		serviceAnalytics: NewDB(0.5, 8000, 4), // 200/s, pressured at the peak
-		servicePayments:  NewDB(0.9, 5000, 5),
+	if o.IncludeIdentity {
+		if fast {
+			m[serviceIdentity] = NewDB(1.0, 2500, 4)
+		} else {
+			m[serviceIdentity] = NewDB(0.6, 4000, 5)
+		}
 	}
+	for _, db := range m {
+		db.SetFailureMult(maxFloat(o.FailureMult, 1))
+	}
+	return m
 }
 
-// Reset rebuilds every DB, tracker and sampler into a pristine run state. All
-// workers must be stopped before calling (the controller stops pools first), so
-// no in-flight handler can touch a half-rebuilt runtime.
-func (rt *Runtime) Reset() {
+// Reset rebuilds every DB, tracker and sampler into a pristine run state for
+// the given options. All workers must be stopped before calling (the controller
+// stops pools first), so no in-flight handler can touch a half-rebuilt runtime.
+func (rt *Runtime) Reset(opts ...RuntimeOpts) {
+	o := RuntimeOpts{}
+	if len(opts) > 0 {
+		o = opts[0]
+	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	rt.dbs = newDBPreset(os.Getenv("BLACKOUT_FAST_DB") == "1")
-	for name := range rt.queues {
-		svc := rt.queues[name].service
-		rt.queues[name] = &queueState{
-			service:  svc,
-			tracker:  NewLoadTracker(),
-			sampler:  NewLatencySampler(),
-			prevPub:  0,
-			prevAck:  0,
-		}
+	rt.resetLocked(o)
+}
+
+// resetLocked rebuilds the runtime from scratch. Caller must hold rt.mu.
+func (rt *Runtime) resetLocked(o RuntimeOpts) {
+	rt.dbs = newDBPreset(os.Getenv("BLACKOUT_FAST_DB") == "1", o)
+	qs := map[string]string{
+		"orders.work":      serviceOrders,
+		"analytics.events": serviceAnalytics,
+		"payments.work":    servicePayments,
+	}
+	if o.IncludeIdentity {
+		qs["identity.worker"] = serviceIdentity
+	}
+	rt.queues = make(map[string]*queueState, len(qs))
+	rt.order = rt.order[:0]
+	for name, svc := range qs {
+		rt.addQueueLocked(name, svc)
+		rt.order = append(rt.order, name)
 	}
 	rt.Gateway = NewLatencySampler()
 }
 
 func (rt *Runtime) addQueue(name, service string) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.addQueueLocked(name, service)
+}
+
+func (rt *Runtime) addQueueLocked(name, service string) {
 	rt.queues[name] = &queueState{
 		service: service,
 		tracker: NewLoadTracker(),
@@ -190,6 +234,7 @@ func (rt *Runtime) AddAcked(queue string, n int) {
 	if ok {
 		t.tracker.AddAcked(int64(n))
 		t.acked.Add(int64(n))
+		t.lastCompletion.Store(time.Now().UnixMilli())
 	}
 }
 
@@ -200,6 +245,7 @@ func (rt *Runtime) AddFailed(queue string, n int) {
 	rt.mu.RUnlock()
 	if ok {
 		t.failed.Add(int64(n))
+		t.lastCompletion.Store(time.Now().UnixMilli())
 	}
 }
 
@@ -235,6 +281,44 @@ func (rt *Runtime) Pending(queue string) int64 {
 	return 0
 }
 
+// SetDBSpike applies an incident latency spike to one queue's DB (Incident 2's
+// "DB latency spikes 10x" scripted event). mult <= 1 resets to baseline.
+func (rt *Runtime) SetDBSpike(queue string, mult float64) error {
+	rt.mu.RLock()
+	t, ok := rt.queues[queue]
+	rt.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("runtime: unknown queue %q", queue)
+	}
+	rt.dbs[t.service].SetMultiplier(mult)
+	return nil
+}
+
+// SetDBCascade seeds every DB's failure multiplier from the campaign cascade
+// (a hot Incident 1 makes Incident 2's failures more likely).
+func (rt *Runtime) SetDBCascade(mult float64) {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	for _, db := range rt.dbs {
+		db.SetFailureMult(maxFloat(mult, 1))
+	}
+}
+
+// Failover shifts the queue's service onto an emergency replica for the lease:
+// latency drops ~5x and the replica surfaces its own inconsistency rate, then
+// a residual error rate lingers after the lease — an imperfect fix, visible in
+// the metrics. Returns an error for unknown queues.
+func (rt *Runtime) Failover(queue string, lease time.Duration) error {
+	rt.mu.RLock()
+	t, ok := rt.queues[queue]
+	rt.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("runtime: unknown queue %q", queue)
+	}
+	rt.dbs[t.service].BeginFailover(lease, 0.2, 0.05, 0.01)
+	return nil
+}
+
 // SuccessRate returns acked/(acked+failed) for a queue (1 if no work yet).
 func (rt *Runtime) SuccessRate(queue string) float64 {
 	rt.mu.RLock()
@@ -248,6 +332,41 @@ func (rt *Runtime) SuccessRate(queue string) float64 {
 		return 1
 	}
 	return float64(t.acked.Load()) / float64(total)
+}
+
+// LastCompletion returns the wall-clock time of the most recent ack or failure
+// for a queue, or the zero Time if nothing has completed this run.
+func (rt *Runtime) LastCompletion(queue string) time.Time {
+	rt.mu.RLock()
+	t, ok := rt.queues[queue]
+	rt.mu.RUnlock()
+	if !ok {
+		return time.Time{}
+	}
+	ms := t.lastCompletion.Load()
+	if ms == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(ms)
+}
+
+// NewestCompletion returns the most recent completion time across all queues,
+// or the zero Time if nothing has completed this run. It is the freshness
+// source for the aggregate customer-success metric.
+func (rt *Runtime) NewestCompletion() time.Time {
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	var newest time.Time
+	for _, q := range rt.queues {
+		ms := q.lastCompletion.Load()
+		if ms == 0 {
+			continue
+		}
+		if t := time.UnixMilli(ms); t.After(newest) {
+			newest = t
+		}
+	}
+	return newest
 }
 
 // QueueSnapshot is a read-only view used by the metrics pass.
