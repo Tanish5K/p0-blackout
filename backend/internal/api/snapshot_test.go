@@ -127,3 +127,34 @@ func TestSnapshotOutcomePresentWhenEnded(t *testing.T) {
 		t.Errorf("outcome health %v != final health %v", snap.Outcome.Health, state.Metrics.SystemHealth)
 	}
 }
+
+func TestSnapshotIncludesAckPolicy(t *testing.T) {
+	state := simulation.NewGame(42, simulation.ConstantProfile{Rate: 1})
+	state.Pools = []simulation.PoolState{{Queue: "orders.work", Workers: 3, AckPolicy: "auto"}}
+	snapshot := SnapshotFromState(state, false)
+	if got := snapshot.Pools[0].AckPolicy; got != "auto" {
+		t.Fatalf("ackPolicy = %q, want auto", got)
+	}
+}
+
+func TestDeltaUsesRunIdentityNotTick(t *testing.T) {
+	prev := &Snapshot{RunID: 7, Tick: 10, Services: []ServiceSnapshot{{ID: "orders", Health: 100}}}
+	cur := &Snapshot{RunID: 7, Tick: 11, Services: []ServiceSnapshot{{ID: "orders", Health: 100}}}
+	delta := Delta(prev, cur)
+	if delta.Services != nil {
+		t.Fatalf("unchanged services should be omitted across ticks: %#v", delta.Services)
+	}
+
+	cur.RunID = 8
+	if got := Delta(prev, cur); got != cur {
+		t.Fatal("a new run must receive the complete snapshot")
+	}
+}
+
+func TestPoolDeltaIncludesAckPolicyChange(t *testing.T) {
+	prev := &Snapshot{RunID: 1, Pools: []PoolSnapshot{{Queue: "orders.work", Workers: 2, AckPolicy: "manual"}}}
+	cur := &Snapshot{RunID: 1, Pools: []PoolSnapshot{{Queue: "orders.work", Workers: 2, AckPolicy: "auto"}}}
+	if got := Delta(prev, cur).Pools; len(got) != 1 || got[0].AckPolicy != "auto" {
+		t.Fatalf("ack policy change missing from delta: %#v", got)
+	}
+}

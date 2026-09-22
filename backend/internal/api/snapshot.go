@@ -10,21 +10,21 @@ import (
 
 // Snapshot is the server-to-client state broadcast matching §4.2.
 type Snapshot struct {
-	Type     string            `json:"type"` // always "snapshot"
-	Tick     int64             `json:"tick"`
-	Clock    string            `json:"clock"` // "02:17:34"
-	Phase    string            `json:"phase"` // "running" | "ended"
+	Type  string `json:"type"` // always "snapshot"
+	Tick  int64  `json:"tick"`
+	Clock string `json:"clock"` // "02:17:34"
+	Phase string `json:"phase"` // "running" | "ended"
 	// RunID and RunStatus identify which run a snapshot belongs to. RunID
 	// increments every start/retry; clients treat a change as a fresh run and
 	// wipe their merged state (events in particular). RunStatus is
 	// "idle" before the first Start and during the run-ends window, so the
 	// frontend can gate the game behind a start screen.
-	RunID    int64             `json:"runId"`
-	RunStatus string           `json:"runStatus"` // "idle" | "running" | "ended"
-	Services []ServiceSnapshot `json:"services"`
-	Queues   []QueueSnapshot   `json:"queues"`
-	Pools    []PoolSnapshot    `json:"pools"`
-	Metrics  MetricsSnapshot   `json:"metrics"`
+	RunID     int64             `json:"runId"`
+	RunStatus string            `json:"runStatus"` // "idle" | "running" | "ended"
+	Services  []ServiceSnapshot `json:"services"`
+	Queues    []QueueSnapshot   `json:"queues"`
+	Pools     []PoolSnapshot    `json:"pools"`
+	Metrics   MetricsSnapshot   `json:"metrics"`
 	// Incident identifies the live scenario and its emergency budget. The
 	// budget is Incident 2's failover allowance (spending it shows here); it
 	// is always included so the client can render "2/2" without merge tricks.
@@ -74,20 +74,20 @@ type ObjectiveSnapshot struct {
 }
 
 type OutcomeSnapshot struct {
-	Failed    bool     `json:"failed"`
-	Reason    string   `json:"reason,omitempty"`
-	EndedAtMs int64    `json:"endedAtMs"`
-	Health    float64  `json:"health"`
-	Success   float64  `json:"success"`
-	P50Ms     float64  `json:"p50Ms"`
-	P99Ms     float64  `json:"p99Ms"`
+	Failed    bool    `json:"failed"`
+	Reason    string  `json:"reason,omitempty"`
+	EndedAtMs int64   `json:"endedAtMs"`
+	Health    float64 `json:"health"`
+	Success   float64 `json:"success"`
+	P50Ms     float64 `json:"p50Ms"`
+	P99Ms     float64 `json:"p99Ms"`
 	// LatencyStale/SuccessStale flag terminal metrics computed with no fresh
 	// completions in the sample window (e.g. pause-everything): the postmortem
 	// renders those as grayed "—" instead of reporting 8ms / 100% as current.
-	LatencyStale bool    `json:"latencyStale"`
-	SuccessStale bool    `json:"successStale"`
-	LatencyAgeMs float64 `json:"latencyAgeMs"`
-	SuccessAgeMs float64 `json:"successAgeMs"`
+	LatencyStale bool     `json:"latencyStale"`
+	SuccessStale bool     `json:"successStale"`
+	LatencyAgeMs float64  `json:"latencyAgeMs"`
+	SuccessAgeMs float64  `json:"successAgeMs"`
 	Timeline     []string `json:"timeline"`
 }
 
@@ -117,10 +117,10 @@ type MetricsSnapshot struct {
 	// Stale flags + ages tell the frontend which rail numbers to gray out as
 	// "no fresh samples" instead of showing frozen/fabricated readings. See
 	// simulation.Metrics.
-	LatencyStale  bool    `json:"latencyStale"`
-	SuccessStale  bool    `json:"successStale"`
-	LatencyAgeMs  float64 `json:"latencyAgeMs"`
-	SuccessAgeMs  float64 `json:"successAgeMs"`
+	LatencyStale bool    `json:"latencyStale"`
+	SuccessStale bool    `json:"successStale"`
+	LatencyAgeMs float64 `json:"latencyAgeMs"`
+	SuccessAgeMs float64 `json:"successAgeMs"`
 }
 
 type LatencyMs struct {
@@ -187,9 +187,10 @@ func SnapshotFromState(s *simulation.GameState, ended bool) Snapshot {
 	snap.Pools = make([]PoolSnapshot, len(s.Pools))
 	for i, p := range s.Pools {
 		snap.Pools[i] = PoolSnapshot{
-			Queue:   p.Queue,
-			Workers: p.Workers,
-			Live:    workerIDs(p.WorkerDetail),
+			Queue:     p.Queue,
+			Workers:   p.Workers,
+			AckPolicy: p.AckPolicy,
+			Live:      workerIDs(p.WorkerDetail),
 		}
 	}
 
@@ -232,12 +233,12 @@ func SnapshotFromState(s *simulation.GameState, ended bool) Snapshot {
 	}
 
 	snap.Metrics = MetricsSnapshot{
-		SystemHealth:  s.Metrics.SystemHealth,
-		SuccessRate:   s.Metrics.SuccessRate,
-		LatencyStale:  s.Metrics.LatencyStale,
-		SuccessStale:  s.Metrics.SuccessStale,
-		LatencyAgeMs:  s.Metrics.LatencyAgeMs,
-		SuccessAgeMs:  s.Metrics.SuccessAgeMs,
+		SystemHealth: s.Metrics.SystemHealth,
+		SuccessRate:  s.Metrics.SuccessRate,
+		LatencyStale: s.Metrics.LatencyStale,
+		SuccessStale: s.Metrics.SuccessStale,
+		LatencyAgeMs: s.Metrics.LatencyAgeMs,
+		SuccessAgeMs: s.Metrics.SuccessAgeMs,
 		LatencyMs: LatencyMs{
 			P50: float64(s.Metrics.LatencyP50.Microseconds()) / 1000.0,
 			P99: float64(s.Metrics.LatencyP99.Microseconds()) / 1000.0,
@@ -250,7 +251,7 @@ func SnapshotFromState(s *simulation.GameState, ended bool) Snapshot {
 // Delta returns a copy of cur with unchanged fields stripped.
 // If prev is nil, returns cur unchanged (full snapshot).
 func Delta(prev, cur *Snapshot) *Snapshot {
-	if prev == nil || prev.Tick != cur.Tick {
+	if prev == nil || prev.RunID != cur.RunID {
 		return cur
 	}
 

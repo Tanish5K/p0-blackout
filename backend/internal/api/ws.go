@@ -12,96 +12,131 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Hub tracks live WebSocket connections and broadcasts game state snapshots.
-// It also dispatches incoming player actions to a registered handler.
+const clientSendBuffer = 64
+
+// Hub tracks live WebSocket clients. Every connection has exactly one writer
+// goroutine; snapshots, action replies, lifecycle replies, and pings all pass
+// through that writer.
 type Hub struct {
-	mu      sync.Mutex
-	conns   map[*websocket.Conn]bool
+	mu      sync.RWMutex
+	clients map[*wsClient]struct{}
 	origin  string
-	handler func(raw []byte) []byte // action dispatcher, set by sim.go
-	// control handles run-lifecycle messages ({"type":"control","action":...}),
-	// dispatched separately from player actions because control can swap the
-	// run (and therefore the action handler) the dispatcher points at.
+	handler func(raw []byte) []byte
 	control func(raw []byte) []byte
+	latest  []byte // latest complete snapshot, used to hydrate late clients
 }
 
-// NewRouter creates the Hub and returns the HTTP handler for /ws and /healthz.
-func NewRouter(origin string) (*Hub, http.Handler) {
-	hub := &Hub{
-		conns:  make(map[*websocket.Conn]bool),
-		origin: origin,
-	}
+type wsClient struct {
+	conn *websocket.Conn
+	send chan []byte
+	done chan struct{}
+	once sync.Once
+}
 
+func (c *wsClient) close() {
+	c.once.Do(func() {
+		close(c.done)
+		_ = c.conn.Close()
+	})
+}
+
+func NewRouter(origin string) (*Hub, http.Handler) {
+	hub := &Hub{clients: make(map[*wsClient]struct{}), origin: origin}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("/ws", hub.handleWS)
 	return hub, mux
 }
 
-// SetActionHandler registers the function called for every incoming player
-// action. The handler receives the raw JSON message and must return a JSON
-// response to send back to the client. Must be called before Run.
+// SetActionHandler atomically swaps the current per-run action dispatcher.
 func (h *Hub) SetActionHandler(fn func(raw []byte) []byte) {
+	h.mu.Lock()
 	h.handler = fn
+	h.mu.Unlock()
 }
 
-// SetControlHandler registers the function called for run-lifecycle control
-// messages ({"type":"control",...}). Control is dispatched before the action
-// handler so starting/retrying a run (which swaps out the action handler) is
-// always reachable.
 func (h *Hub) SetControlHandler(fn func(raw []byte) []byte) {
+	h.mu.Lock()
 	h.control = fn
+	h.mu.Unlock()
 }
 
-// Broadcast sends data to every connected client. Dead connections are
-// silently dropped. This is the primary output path for game state snapshots.
+// Broadcast sends data to every connected client. Snapshot callers should use
+// BroadcastSnapshot so reconnecting clients receive a complete current frame.
 func (h *Hub) Broadcast(data []byte) {
+	h.broadcast(data, nil)
+}
+
+// BroadcastSnapshot broadcasts data (which may be a delta) and caches full as
+// the authoritative reconnect frame. Buffers are copied before return.
+func (h *Hub) BroadcastSnapshot(data, full []byte) {
+	h.broadcast(data, full)
+}
+
+func (h *Hub) broadcast(data, full []byte) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	for conn := range h.conns {
-		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			conn.Close()
-			delete(h.conns, conn)
+	if full != nil {
+		h.latest = append(h.latest[:0], full...)
+	}
+	clients := make([]*wsClient, 0, len(h.clients))
+	for client := range h.clients {
+		clients = append(clients, client)
+	}
+	h.mu.Unlock()
+
+	for _, client := range clients {
+		if !enqueue(client, data) {
+			h.remove(client)
 		}
 	}
 }
 
-// Run starts the Hub's background loop: sends pings and garbage-collects dead
-// connections. Block until ctx is done.
+func enqueue(client *wsClient, data []byte) bool {
+	msg := append([]byte(nil), data...)
+	select {
+	case <-client.done:
+		return false
+	case client.send <- msg:
+		return true
+	default:
+		// Slow clients cannot stall the simulation or grow memory without bound.
+		client.close()
+		return false
+	}
+}
+
+func (h *Hub) remove(client *wsClient) {
+	h.mu.Lock()
+	if _, ok := h.clients[client]; ok {
+		delete(h.clients, client)
+		client.close()
+	}
+	h.mu.Unlock()
+}
+
+// Run closes clients on server shutdown. Writer pumps own heartbeat scheduling
+// to preserve the single-writer invariant.
 func (h *Hub) Run(ctx context.Context) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			h.mu.Lock()
-			for conn := range h.conns {
-				conn.Close()
-			}
-			h.conns = make(map[*websocket.Conn]bool)
-			h.mu.Unlock()
-			return
-		case <-ticker.C:
-			h.mu.Lock()
-			for conn := range h.conns {
-				if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
-					conn.Close()
-					delete(h.conns, conn)
-				}
-			}
-			h.mu.Unlock()
-		}
+	<-ctx.Done()
+	h.mu.Lock()
+	clients := make([]*wsClient, 0, len(h.clients))
+	for client := range h.clients {
+		clients = append(clients, client)
+		delete(h.clients, client)
+	}
+	h.mu.Unlock()
+	for _, client := range clients {
+		client.close()
 	}
 }
 
-// ConnCount returns the number of live connections (for diagnostics).
 func (h *Hub) ConnCount() int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return len(h.conns)
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.clients)
 }
 
 func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -111,66 +146,83 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upgrader := websocket.Upgrader{
-		CheckOrigin: func(*http.Request) bool { return true }, // checked above
-	}
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("ws upgrade failed: %v", err)
 		return
 	}
+	client := &wsClient{conn: conn, send: make(chan []byte, clientSendBuffer), done: make(chan struct{})}
 
 	h.mu.Lock()
-	h.conns[conn] = true
-	n := len(h.conns)
+	h.clients[client] = struct{}{}
+	latest := append([]byte(nil), h.latest...)
+	n := len(h.clients)
 	h.mu.Unlock()
 	log.Printf("ws client connected (total %d)", n)
 
-	defer func() {
-		h.mu.Lock()
-		delete(h.conns, conn)
-		n := len(h.conns)
-		h.mu.Unlock()
-		conn.Close()
-		log.Printf("ws client disconnected (total %d)", n)
-	}()
-
-	// Heartbeat to detect dead clients.
-	conn.SetPongHandler(func(string) error {
-		return conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	})
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-
-	// Send hello to confirm the socket is live.
-	if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"hello","msg":"connected"}`)); err != nil {
+	go h.writePump(client)
+	if !enqueue(client, []byte(`{"type":"hello","msg":"connected"}`)) {
+		h.remove(client)
+		return
+	}
+	if len(latest) > 0 && !enqueue(client, latest) {
+		h.remove(client)
 		return
 	}
 
-	// Read loop: dispatch player actions / control messages to their handlers.
+	defer func() {
+		h.remove(client)
+		log.Printf("ws client disconnected (total %d)", h.ConnCount())
+	}()
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	})
+	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			return
 		}
-		if h.control != nil {
-			var probe struct {
-				Type string `json:"type"`
-			}
-			if json.Unmarshal(msg, &probe) == nil && probe.Type == "control" {
-				if resp := h.control(msg); resp != nil {
-					if err := conn.WriteMessage(websocket.TextMessage, resp); err != nil {
-						return
-					}
-				}
-				continue
-			}
+		if response := h.dispatch(msg); response != nil && !enqueue(client, response) {
+			return
 		}
-		if h.handler == nil {
-			continue
+	}
+}
+
+func (h *Hub) dispatch(msg []byte) []byte {
+	h.mu.RLock()
+	control, handler := h.control, h.handler
+	h.mu.RUnlock()
+	if control != nil {
+		var probe struct {
+			Type string `json:"type"`
 		}
-		resp := h.handler(msg)
-		if resp != nil {
-			if err := conn.WriteMessage(websocket.TextMessage, resp); err != nil {
+		if json.Unmarshal(msg, &probe) == nil && probe.Type == "control" {
+			return control(msg)
+		}
+	}
+	if handler == nil {
+		return nil
+	}
+	return handler(msg)
+}
+
+func (h *Hub) writePump(client *wsClient) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	defer h.remove(client)
+	for {
+		select {
+		case <-client.done:
+			return
+		case msg := <-client.send:
+			if err := client.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				return
+			}
+		case <-ticker.C:
+			if err := client.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
 			}
 		}
@@ -180,7 +232,6 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 func (h *Hub) originAllowed(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		// Non-browser clients (tests, tools) send no Origin.
 		return true
 	}
 	return strings.EqualFold(strings.TrimRight(origin, "/"), strings.TrimRight(h.origin, "/"))

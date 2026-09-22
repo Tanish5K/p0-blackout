@@ -85,16 +85,16 @@ func NewRunController(
 	reg *rabbitmq.Registry,
 ) *RunController {
 	return &RunController{
-		ctx:     ctx,
-		broker:  broker,
-		pub:     pub,
-		mgmt:    mgmt,
-		rt:      rt,
-		hub:     hub,
-		pm:      pm,
-		reg:     reg,
-		status:  RunIdle,
-		dbMult:  1.0,
+		ctx:    ctx,
+		broker: broker,
+		pub:    pub,
+		mgmt:   mgmt,
+		rt:     rt,
+		hub:    hub,
+		pm:     pm,
+		reg:    reg,
+		status: RunIdle,
+		dbMult: 1.0,
 	}
 }
 
@@ -298,7 +298,7 @@ func (c *RunController) broadcastRunFrame(runID int64, st RunStatus) {
 	snap.CampaignTotal = c.campLength()
 	snap.Events = nil
 	if data, err := api.MarshalSnapshot(&snap); err == nil {
-		c.hub.Broadcast(data)
+		c.hub.BroadcastSnapshot(data, data)
 	}
 }
 
