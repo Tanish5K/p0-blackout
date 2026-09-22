@@ -13,6 +13,7 @@ export default function App() {
   const { runAction, runControl } = conn
   const display = useTick(conn.status === 'connected' ? conn.snapshot : null)
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [dismissedOutcomeRunId, setDismissedOutcomeRunId] = useState<number | null>(null)
 
   // The map renders interpolated (smooth) state; the inspector and tape
   // read the authoritative merged snapshot from the WS.
@@ -51,6 +52,11 @@ export default function App() {
 
       <EventTape events={conn.snapshot.events} />
 
+      <ActionStatus
+        pendingCount={Object.keys(conn.pendingActions).length}
+        feedback={conn.actionFeedback}
+      />
+
       {runStatus === 'idle' && (
         <HomeScreen
           status={conn.status}
@@ -60,16 +66,41 @@ export default function App() {
         />
       )}
 
-      {runStatus === 'ended' && conn.snapshot.outcome && (
+      {runStatus === 'ended' &&
+        conn.snapshot.outcome &&
+        dismissedOutcomeRunId !== conn.snapshot.runId && (
         <Postmortem
           outcome={conn.snapshot.outcome}
           clock={conn.snapshot.clock}
           incidentNumber={conn.snapshot.incidentNumber}
           campaignTotal={conn.snapshot.campaignTotal}
-          onClose={() => undefined}
+          onClose={() => setDismissedOutcomeRunId(conn.snapshot.runId)}
           onRetry={() => runControl('retry')}
         />
       )}
     </main>
+  )
+}
+
+function ActionStatus({
+  pendingCount,
+  feedback,
+}: {
+  pendingCount: number
+  feedback?: { ok: boolean; message?: string }
+}) {
+  if (pendingCount === 0 && !feedback) return null
+
+  return (
+    <div
+      className={`action-feedback ${feedback ? (feedback.ok ? 'ok' : 'error') : 'pending'}`}
+      role={feedback && !feedback.ok ? 'alert' : 'status'}
+      aria-live={feedback && !feedback.ok ? 'assertive' : 'polite'}
+      aria-atomic="true"
+    >
+      {pendingCount > 0
+        ? `${pendingCount} operation${pendingCount === 1 ? '' : 's'} pending…`
+        : feedback?.message}
+    </div>
   )
 }

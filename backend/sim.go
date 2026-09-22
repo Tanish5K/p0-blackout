@@ -74,13 +74,13 @@ func runSimulation(ctx context.Context, pub *rabbitmq.Publisher, mgmt *rabbitmq.
 	// it happens, instead of the player having to spot it in a 10-tick rail.
 	warn70, warn50 := false, false
 
-// Action log events are stamped with the CURRENT tick. They share the log delta
-// with that tick's traffic and arrive after it (same broadcast), so the client
-// dedup (append only events with tick > last-seen tick), which keys off the
-// previous message's LAST event, keeps the whole sequence.
-adapter := &registryAdapter{reg: reg, state: state}
-actionHandler := api.NewActionHandler(pm, adapter, adapter, state.Log, func() int64 { return state.Tick })
-hub.SetActionHandler(actionHandler)
+	// Action log events are stamped with the CURRENT tick. They share the log delta
+	// with that tick's traffic and arrive after it (same broadcast), so the client
+	// dedup (append only events with tick > last-seen tick), which keys off the
+	// previous message's LAST event, keeps the whole sequence.
+	adapter := &registryAdapter{reg: reg, state: state}
+	actionHandler := api.NewActionHandler(pm, adapter, adapter, state.Log, func() int64 { return state.Tick })
+	hub.SetActionHandler(actionHandler)
 
 	// Incident 2's scripted DB event: the spike is active while elapsed is
 	// inside any milestone window; entering/leaving is a log+event transition
@@ -224,7 +224,9 @@ hub.SetActionHandler(actionHandler)
 			lastLogSeq = state.Log.Seq()
 			delta := api.Delta(prevSnap, &snap)
 			if data, err := api.MarshalSnapshot(delta); err == nil {
-				hub.Broadcast(data)
+				if full, fullErr := api.MarshalSnapshot(&snap); fullErr == nil {
+					hub.BroadcastSnapshot(data, full)
+				}
 			}
 			prevSnap = &snap
 

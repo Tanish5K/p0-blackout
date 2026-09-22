@@ -38,13 +38,32 @@ export interface SnapshotMessage {
   services?: ServiceSnapshot[]
   queues?: QueueSnapshot[]
   pools?: PoolSnapshot[]
-  metrics?: MetricsSnapshot
+  metrics?: MetricsDelta
   objectives?: ObjectiveSnapshot[]
   outcome?: OutcomeSnapshot
   events?: BackendEvent[]
 }
 
-export type ServerMessage = HelloMessage | SnapshotMessage
+export interface ActionResultMessage {
+  type: 'action_result'
+  requestId?: string
+  action?: string
+  ok: boolean
+  message?: string
+  error?: string
+}
+
+/** Compatibility shape returned by older backends before action_result typing. */
+export interface LegacyActionResultMessage {
+  type?: undefined
+  requestId?: string
+  action?: string
+  ok: boolean
+  message?: string
+  error?: string
+}
+
+export type ServerMessage = HelloMessage | SnapshotMessage | ActionResultMessage
 
 /* ── Snapshot sub-types ──────────────────────────────────────────── */
 
@@ -104,6 +123,17 @@ export interface MetricsSnapshot {
   successStale: boolean
   latencyAgeMs: number
   successAgeMs: number
+}
+
+/** Metrics may be sparse in delta snapshots; zero is always a real value. */
+export interface MetricsDelta {
+  systemHealth?: number
+  successRate?: number
+  latencyMs?: Partial<LatencyMs>
+  latencyStale?: boolean
+  successStale?: boolean
+  latencyAgeMs?: number
+  successAgeMs?: number
 }
 
 /* ── Objectives + terminal outcome (Phase 5) ─────────────────────── */
@@ -174,6 +204,8 @@ export interface ConnectionState {
   status: 'connecting' | 'connected' | 'disconnected'
   error?: string
   snapshot: MergedSnapshot
+  pendingActions: Record<string, string>
+  actionFeedback?: ActionFeedback
 }
 
 /* ── Player actions (Phase 5) ────────────────────────────────────── */
@@ -184,11 +216,14 @@ export interface ActionMessage {
   type: 'action'
   action: string
   payload: ActionPayload
+  requestId: string
 }
 
-export type RunAction = (action: string, payload?: ActionPayload) => void
+export type RunAction = (action: string, payload?: ActionPayload) => string | undefined
 
-export interface ActionResponse {
+export interface ActionFeedback {
+  requestId?: string
+  action?: string
   ok: boolean
   message?: string
 }
