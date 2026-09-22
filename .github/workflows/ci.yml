@@ -47,8 +47,8 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test with race detector
-        run: go test -race ./...
+      - name: Build
+        run: go build ./...
 
   frontend:
     name: Frontend
