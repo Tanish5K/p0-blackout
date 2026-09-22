@@ -58,3 +58,34 @@ func TestScaleRejectsUnknownQueue(t *testing.T) {
 		t.Error("Scale on a paused service's queue must fail")
 	}
 }
+
+func TestConfigureDoesNotStartPoolsWhileSuspended(t *testing.T) {
+	registry := AllServices()
+	manager := NewPoolManager(nil, registry, map[string]int{"orders.work": 2}, nil)
+	manager.StopAndWait()
+	manager.Configure(map[string]int{"orders.work": 9})
+	manager.reconcile()
+	if got := manager.PoolCount(); got != 0 {
+		t.Fatalf("configured suspended manager started %d pools", got)
+	}
+	if got := manager.Workers("orders.work"); got != 9 {
+		t.Fatalf("workers = %d, want 9", got)
+	}
+	if got := manager.AckPolicy("orders.work"); got != string(AckManual) {
+		t.Fatalf("ack policy = %q, want manual", got)
+	}
+}
+
+func TestRunShutdownLeavesManagerSuspended(t *testing.T) {
+	registry := AllServices()
+	manager := NewPoolManager(nil, registry, nil, nil)
+	manager.suspended = true // prevent a nil-broker pool from starting in this unit test
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { manager.Run(ctx); close(done) }()
+	cancel()
+	<-done
+	if !manager.suspended {
+		t.Fatal("shutdown should leave reconciliation suspended")
+	}
+}

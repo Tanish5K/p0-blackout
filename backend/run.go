@@ -56,11 +56,13 @@ type RunController struct {
 	pm     *rabbitmq.PoolManager
 	reg    *rabbitmq.Registry
 
-	mu        sync.Mutex
-	runId     int64
-	status    RunStatus
-	cancelRun context.CancelFunc
-	doneRun   chan struct{}
+	mu              sync.Mutex
+	lifecycleMu     sync.Mutex // serializes teardown/configure/start across callers
+	runId           int64
+	status          RunStatus
+	cancelRun       context.CancelFunc
+	doneRun         chan struct{}
+	teardownTimeout time.Duration
 
 	// Campaign position: which incident the NEXT begin() starts. Advances on a
 	// survived run; a failed run keeps the player on the same incident.
@@ -85,16 +87,17 @@ func NewRunController(
 	reg *rabbitmq.Registry,
 ) *RunController {
 	return &RunController{
-		ctx:    ctx,
-		broker: broker,
-		pub:    pub,
-		mgmt:   mgmt,
-		rt:     rt,
-		hub:    hub,
-		pm:     pm,
-		reg:    reg,
-		status: RunIdle,
-		dbMult: 1.0,
+		ctx:             ctx,
+		broker:          broker,
+		pub:             pub,
+		mgmt:            mgmt,
+		rt:              rt,
+		hub:             hub,
+		pm:              pm,
+		reg:             reg,
+		status:          RunIdle,
+		dbMult:          1.0,
+		teardownTimeout: 5 * time.Second,
 	}
 }
 
@@ -125,18 +128,25 @@ func (c *RunController) campLength() int {
 	return len(campaign)
 }
 
-// settleLine applies the campaign-cascade rule after a run's outcome lands:
-// surviving Incident 1 with peak total workers >= the cascade threshold raises
+// settleCascade applies the campaign-cascade rule after a run's outcome lands:
+// surviving Incident 1 with enough workers added above its baseline raises
 // the multiplier Incident 2's DBs are seeded from (capped), modelling "your
 // scaling is what shook the shared DB loose". Expected value below the
 // threshold is left untouched, so restrained play is NOT punished. Called only
 // on a survived incident-1 run (the campaign advance point).
 func (c *RunController) settleCascade(peak int) {
-	const cascadeThreshold = 14 // peak total configured workers
-	if peak < cascadeThreshold {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.settleCascadeLocked(peak)
+}
+
+func (c *RunController) settleCascadeLocked(peak int) {
+	const cascadeThreshold = 8 // PLAN: aggressive scaling adds 8–12 workers
+	baseline := totalConfiguredWorkers(defaultWorkerCounts())
+	added := peak - baseline
+	if added < cascadeThreshold {
 		return
 	}
-	c.mu.Lock()
 	next := c.dbMult * 1.5
 	if next > 2.0 {
 		next = 2.0
@@ -144,9 +154,16 @@ func (c *RunController) settleCascade(peak int) {
 	c.lastCascadeStep = next - c.dbMult
 	c.dbMult = next
 	mult := c.dbMult
-	c.mu.Unlock()
-	log.Printf("campaign: incident 1 survived with peak %d workers >= %d → incident 2 DB cascade multiplier %.2fx (last step +%.2fx)",
-		peak, cascadeThreshold, mult, c.lastCascadeStep)
+	log.Printf("campaign: incident 1 survived after adding %d workers (peak=%d baseline=%d threshold=%d) → incident 2 DB cascade multiplier %.2fx (last step +%.2fx)",
+		added, peak, baseline, cascadeThreshold, mult, c.lastCascadeStep)
+}
+
+func totalConfiguredWorkers(counts map[string]int) int {
+	var total int
+	for _, count := range counts {
+		total += count
+	}
+	return total
 }
 
 // Boot broadcasts the idle state so a freshly-connected game screen has a
@@ -189,20 +206,20 @@ func (c *RunController) Retry() error {
 // begin is the ordered restart sequence described on the type. It rejects a
 // second concurrent run but happily restarts from "ended" or "idle".
 func (c *RunController) begin() error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	c.mu.Lock()
 	if c.status == RunRunning {
 		c.mu.Unlock()
 		return errors.New("a run is already in progress")
 	}
-	// Reserve the next run ID and detach any prior run's handles.
-	runID := c.runId + 1
-	c.runId = runID
-	c.status = RunRunning // provisional; confirmed below as the run launches
+	// Reserve lifecycle ownership without changing the run identity until the
+	// prior run has verifiably stopped.
+	priorStatus := c.status
+	c.status = RunRunning
 	cancel, done := c.cancelRun, c.doneRun
-	c.cancelRun, c.doneRun = nil, nil
 	c.mu.Unlock()
-
-	spec := c.buildSpec(runID)
 
 	// --- 1. Old-run teardown, fully COMPLETED before anything new starts. ---
 	// Cancellation is async: a stray tick or consumer callback from the old
@@ -210,13 +227,28 @@ func (c *RunController) begin() error {
 	// the goroutine to return before touching any shared state.
 	if cancel != nil {
 		cancel()
+		timeout := c.teardownTimeout
+		if timeout <= 0 {
+			timeout = 5 * time.Second
+		}
 		select {
 		case <-done:
 			log.Printf("run controller: previous run stopped cleanly")
-		case <-time.After(5 * time.Second):
-			log.Printf("run controller: WARNING — previous run did not stop within 5s; proceeding anyway")
+		case <-time.After(timeout):
+			c.mu.Lock()
+			c.status = priorStatus
+			c.mu.Unlock()
+			return fmt.Errorf("previous run did not stop within %s; restart aborted", timeout)
 		}
 	}
+
+	c.mu.Lock()
+	runID := c.runId + 1
+	c.runId = runID
+	c.status = RunRunning
+	c.cancelRun, c.doneRun = nil, nil
+	c.mu.Unlock()
+	spec := c.buildSpec(runID)
 
 	// Domino order so no old worker can write into fresh state:
 	//   pools first (Reset waits per-pool for handlers to finish),
@@ -224,7 +256,8 @@ func (c *RunController) begin() error {
 	//   then wire this incident's new service (Incident 2: identity),
 	//   then queue purge (covers the newly-wired queue too),
 	//   then settle the pools at the reset worker set.
-	c.pm.Reset(spec.counts)
+	c.pm.StopAndWait()
+	c.pm.Configure(spec.counts)
 	c.rt.Reset(simulation.RuntimeOpts{
 		IncludeIdentity: spec.options.IncludeIdentity,
 		FailureMult:     spec.options.DBFailureMult,
@@ -235,10 +268,21 @@ func (c *RunController) begin() error {
 			log.Printf("run controller: identity wiring no-op (already wired)")
 		}
 	}
+	// Declare the complete target topology before purging. Newly introduced
+	// queues (for example Identity in incident 2) do not exist until this step.
+	ch, err := c.broker.Channel()
+	if err != nil {
+		return c.abortBegin(runID, fmt.Errorf("open topology channel: %w", err))
+	}
+	if err := c.reg.WiredTopology().Declare(c.ctx, ch); err != nil {
+		_ = ch.Close()
+		return c.abortBegin(runID, fmt.Errorf("declare run topology: %w", err))
+	}
+	_ = ch.Close()
 	if err := purgeQueues(c.ctx, c.broker, c.reg.WiredQueues()); err != nil {
 		log.Printf("run controller: queue purge failed (%v); continuing", err)
 	}
-	c.pm.Reconcile()
+	c.pm.Start()
 
 	// --- 2. Launch the fresh run. ------------------------------------------
 	child, cancelChild := context.WithCancel(c.ctx)
@@ -261,6 +305,17 @@ func (c *RunController) begin() error {
 	return nil
 }
 
+func (c *RunController) abortBegin(runID int64, err error) error {
+	c.mu.Lock()
+	if c.runId == runID {
+		c.status = RunEnded
+		c.cancelRun = nil
+		c.doneRun = nil
+	}
+	c.mu.Unlock()
+	return err
+}
+
 // finish marks the controller idle-of-run when the run launched with the given
 // ID returns (either a terminal outcome broadcast by runSimulation or an
 // external cancel). A newer run that already claimed the controller is left
@@ -280,11 +335,12 @@ func (c *RunController) finish(id int64, out *simulation.Outcome) {
 		return // externally cancelled; no campaign consequence
 	}
 	if !out.Failed && c.incidentIdx < len(campaign)-1 {
-		c.settleCascade(out.PeakWorkers)
+		c.settleCascadeLocked(out.PeakWorkers)
+		completed := campaign[c.incidentIdx]
 		c.incidentIdx++
 		next := campaign[c.incidentIdx]
 		log.Printf("campaign: incident %d \"%s\" SURVIVED → next up: %d \"%s\"",
-			out.FinalTicks, campaign[c.incidentIdx-1].Name, next.Number, next.Name)
+			completed.Number, completed.Name, next.Number, next.Name)
 	}
 }
 

@@ -32,9 +32,10 @@ type PoolManager struct {
 	// switching it rebuilds the queue's pool with a new Consume autoAck flag.
 	ackPolicy map[string]string
 
-	mu       sync.Mutex
-	pools    map[string]*poolEntry
-	sink     *eventSink
+	mu        sync.Mutex
+	pools     map[string]*poolEntry
+	sink      *eventSink
+	suspended bool // lifecycle reset in progress; registry events cannot start pools
 }
 
 // eventSink routes crash/redelivery events from the consumer layer onto the
@@ -135,6 +136,9 @@ func (m *PoolManager) reconcile() {
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.suspended {
+		return
+	}
 
 	// Start any desired queue that has no pool yet. desired already comes from
 	// WiredQueues, so unwired/stub queues are skipped here by construction; the
@@ -186,10 +190,17 @@ func (m *PoolManager) Reconcile() {
 	m.reconcile()
 }
 
-// Stop stops every pool.
+// Stop stops every pool and leaves automatic reconciliation suspended.
 func (m *PoolManager) Stop() {
+	m.StopAndWait()
+}
+
+// StopAndWait cancels every consumer pool and waits for its worker goroutines
+// to exit. Start must be called after the next run is fully configured.
+func (m *PoolManager) StopAndWait() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.suspended = true
 	for q, entry := range m.pools {
 		entry.cancel()
 		log.Printf("pool manager stopping %q", q)
@@ -200,9 +211,31 @@ func (m *PoolManager) Stop() {
 	}
 }
 
+// Configure replaces per-run counts and ack policies without starting pools.
+func (m *PoolManager) Configure(counts map[string]int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.counts = make(map[string]int, len(counts))
+	m.ackPolicy = make(map[string]string, len(counts))
+	for queue, workers := range counts {
+		m.counts[queue] = workers
+		m.ackPolicy[queue] = string(AckManual)
+	}
+}
+
+// Start resumes registry reconciliation and synchronously starts pools for the
+// currently wired topology.
+func (m *PoolManager) Start() {
+	m.mu.Lock()
+	m.suspended = false
+	m.mu.Unlock()
+	m.reconcile()
+}
+
 func (m *PoolManager) stopAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.suspended = true
 	for _, entry := range m.pools {
 		entry.cancel()
 	}
@@ -258,20 +291,9 @@ func (m *PoolManager) restartPoolLocked(queue string) {
 // every pool goroutine to exit before returning, so no worker from the old
 // run can be mid-handler while the runtime resets underneath it.
 func (m *PoolManager) Reset(counts map[string]int) {
-	m.Stop()
-	m.mu.Lock()
-	m.counts = make(map[string]int, len(counts))
-	for k, v := range counts {
-		m.counts[k] = v
-	}
-	// Ack policy is per-run too: a player's manual/auto choice must not carry
-	// between incidents any more than their scaling does.
-	m.ackPolicy = make(map[string]string, len(counts))
-	for k := range counts {
-		m.ackPolicy[k] = string(AckManual)
-	}
-	m.mu.Unlock()
-	m.reconcile()
+	m.StopAndWait()
+	m.Configure(counts)
+	m.Start()
 	log.Printf("pool manager reset (%d pools at defaults)", len(m.counts))
 }
 
